@@ -1,0 +1,11 @@
+# Core dependencies for SUFFICIENT: Fetal MRI Super-Resolution
+torch
+numpy
+nibabel
+tqdm
+accelerate
+monai
+# Optional dependencies for visualization
+scipy
+matplotlib
+streamlit

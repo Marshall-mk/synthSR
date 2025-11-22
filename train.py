@@ -1,0 +1,509 @@
+import os
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.multiprocessing as mp
+from tqdm import tqdm
+from typing import List
+
+# MONAI imports
+from monai.data import DataLoader
+
+# Import our modules
+from src.model import UNet3D
+from src.utils import (
+    save_model_checkpoint,
+    get_image_paths,
+    save_training_config,
+    find_latest_checkpoint,
+)
+from src.data import HRLRDataGenerator, create_dataset
+
+
+def train_regression_model(
+    hr_image_paths: List[str],
+    model_dir: str,
+    epochs: int = 100,
+    batch_size: int = 1,
+    learning_rate: float = 1e-4,
+    output_shape: tuple = (128, 128, 128),
+    checkpoint: str = None,
+    device: str = "cuda",
+    save_interval: int = 10,
+    val_image_paths: List[str] = None,
+    atlas_res: list = [1.0, 1.0, 1.0],
+    min_resolution: list = [1.0, 1.0, 1.0],
+    max_res_aniso: list = [9.0, 9.0, 9.0],
+    randomise_res: bool = True,
+    apply_lr_deformation: bool = True,
+    apply_bias_field: bool = True,
+    apply_intensity_aug: bool = True,
+    enable_90_rotations: bool = False,
+    clip_to_unit_range: bool = True,
+    num_workers: int = None,
+    use_cache: bool = False,
+):
+    """
+    Stage 1: Train regression UNet
+
+    Args:
+        hr_image_paths: List of paths to high-resolution images
+        model_dir: Directory to save trained models
+        epochs: Number of training epochs
+        batch_size: Batch size
+        learning_rate: Learning rate
+        output_shape: Output volume shape
+        checkpoint: Optional checkpoint to resume from
+        device: 'cuda' or 'cpu'
+        save_interval: Save checkpoint every N epochs
+        val_image_paths: Optional list of validation image paths
+        atlas_res: Physical resolution of input HR images [x, y, z] in mm
+        min_resolution: Minimum resolution for randomization
+        max_res_aniso: Maximum anisotropic resolution
+        randomise_res: Whether to randomize resolution
+        apply_lr_deformation: Whether to apply deformation to LR
+        apply_bias_field: Whether to apply bias field
+        apply_intensity_aug: Whether to apply intensity augmentation
+        enable_90_rotations: Enable 90° rotations
+        clip_to_unit_range: Whether to clip images to [0, 1] range
+        num_workers: Number of data loading workers
+        use_cache: Whether to use CacheDataset
+    """
+    print("=" * 80)
+    print("STAGE 1: Training Regression UNet")
+    print("=" * 80)
+
+    # Create model directory
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Auto-detect optimal num_workers if not provided
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        if device == "cuda" and torch.cuda.is_available():
+            num_workers = min(4, max(cpu_count // 2, 1))
+        elif cpu_count >= 4:
+            num_workers = 2
+        else:
+            num_workers = 0
+
+    # Enable pin_memory for faster GPU transfer
+    pin_memory = device == "cuda" and torch.cuda.is_available() and num_workers > 0
+
+    print(
+        f"DataLoader settings: num_workers={num_workers}, pin_memory={pin_memory}, use_cache={use_cache}"
+    )
+
+    # Create data generator
+    print(f"Input HR image resolution: {atlas_res} mm")
+    print(f"Resolution randomization: {min_resolution} to {max_res_aniso} mm")
+    print(
+        f"LR deformation: {apply_lr_deformation}, "
+        f"Bias field: {apply_bias_field}, Intensity aug: {apply_intensity_aug}"
+    )
+
+    generator = HRLRDataGenerator(
+        atlas_res=atlas_res,
+        target_res=[1.0, 1.0, 1.0],
+        output_shape=list(output_shape),
+        min_resolution=min_resolution,
+        max_res_aniso=max_res_aniso,
+        randomise_res=randomise_res,
+        apply_lr_deformation=apply_lr_deformation,
+        apply_bias_field=apply_bias_field,
+        apply_intensity_aug=apply_intensity_aug,
+        enable_90_rotations=enable_90_rotations,
+        clip_to_unit_range=clip_to_unit_range,  # Ensure [0, 1] range
+    )
+
+    # Create dataset
+    dataset = create_dataset(
+        image_paths=hr_image_paths,
+        generator=generator,
+        target_shape=list(output_shape),
+        target_spacing=atlas_res,
+        use_cache=use_cache,
+        return_resolution=False,
+        is_training=True,
+    )
+
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
+
+    print(f"Training dataset: {len(dataset)} images")
+
+    # Create validation dataset if provided
+    val_dataloader = None
+    if val_image_paths:
+        val_dataset = create_dataset(
+            image_paths=val_image_paths,
+            generator=generator,
+            target_shape=list(output_shape),
+            target_spacing=atlas_res,
+            use_cache=use_cache,
+            return_resolution=False,
+            is_training=False,
+        )
+
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+        )
+        print(f"Validation dataset: {len(val_dataset)} images")
+
+    # Create regression UNet
+    model = UNet3D(
+        nb_features=24,
+        input_shape=(1, *output_shape),
+        nb_levels=5,
+        conv_size=3,
+        nb_labels=1,
+        feat_mult=2,
+        final_pred_activation="linear",
+        nb_conv_per_level=2,
+    )
+
+    # Move model to device
+    model = model.to(device)
+
+    # Auto-detect and load checkpoint
+    start_epoch = 0
+    checkpoint_data = None
+
+    # If no checkpoint specified, try to find the latest one automatically
+    if checkpoint is None:
+        checkpoint = find_latest_checkpoint(model_dir)
+        if checkpoint:
+            print(f"Auto-detected checkpoint: {checkpoint}")
+
+    # Load checkpoint if available
+    if checkpoint and os.path.exists(checkpoint):
+        print(f"Loading checkpoint from {checkpoint}")
+        checkpoint_data = torch.load(checkpoint, map_location=device)
+        model.load_state_dict(checkpoint_data["model_state_dict"])
+        start_epoch = checkpoint_data.get("epoch", 0) + 1
+        print(f"Resuming training from epoch {start_epoch}")
+    else:
+        print("No checkpoint found. Starting training from scratch.")
+
+    # Optimizer and loss
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.L1Loss()
+
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7
+    )
+
+    # Load optimizer and scheduler state if resuming
+    if checkpoint_data is not None:
+        if "optimizer_state_dict" in checkpoint_data:
+            print("Loading optimizer state...")
+            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint_data:
+            print("Loading scheduler state...")
+            scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Training for {epochs} epochs, batch size {batch_size}")
+    print(f"Initial learning rate: {learning_rate}")
+    print(f"Device: {device}")
+
+    # Training loop
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        epoch_loss = 0.0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
+        for batch_idx, (input_img, target_img) in enumerate(pbar):
+            # Move to device
+            input_img = input_img.to(device)
+            target_img = target_img.to(device)
+
+            # Forward pass
+            output = model(input_img)
+            loss = criterion(output, target_img)
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        avg_loss = epoch_loss / len(dataloader)
+
+        # Validation
+        val_loss = None
+        if val_dataloader:
+            model.eval()
+            val_epoch_loss = 0.0
+            with torch.no_grad():
+                for input_img, target_img in val_dataloader:
+                    input_img = input_img.to(device)
+                    target_img = target_img.to(device)
+                    output = model(input_img)
+                    loss = criterion(output, target_img)
+                    val_epoch_loss += loss.item()
+            val_loss = val_epoch_loss / len(val_dataloader)
+            print(
+                f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - "
+                f"Val Loss: {val_loss:.4f} - LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+        else:
+            print(
+                f"Epoch {epoch + 1}/{epochs} - Average Loss: {avg_loss:.4f} - "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+        # Update learning rate scheduler
+        scheduler.step(val_loss if val_loss is not None else avg_loss)
+
+        # Save checkpoint at specified intervals
+        if (epoch + 1) % save_interval == 0:
+            checkpoint_path = os.path.join(
+                model_dir, f"regression_unet_epoch_{epoch + 1:03d}.pth"
+            )
+            model_config = {
+                "nb_features": 24,
+                "input_shape": (1, *output_shape),
+                "nb_levels": 5,
+                "conv_size": 3,
+                "nb_labels": 1,
+                "feat_mult": 2,
+                "final_pred_activation": "linear",
+                "nb_conv_per_level": 2,
+            }
+            save_model_checkpoint(
+                filepath=checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                loss=avg_loss,
+                val_loss=val_loss,
+                model_type="unet3d",
+                model_config=model_config,
+                scheduler_state_dict=scheduler.state_dict(),
+            )
+            print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Save final model
+    final_path = os.path.join(model_dir, "regression_unet_final.pth")
+    model_config = {
+        "nb_features": 24,
+        "input_shape": (1, *output_shape),
+        "nb_levels": 5,
+        "conv_size": 3,
+        "nb_labels": 1,
+        "feat_mult": 2,
+        "final_pred_activation": "linear",
+        "nb_conv_per_level": 2,
+    }
+    save_model_checkpoint(
+        filepath=final_path,
+        model=model,
+        optimizer=optimizer,
+        epoch=epochs - 1,
+        model_type="unet3d",
+        model_config=model_config,
+        scheduler_state_dict=scheduler.state_dict(),
+    )
+    print(f"Training complete! Final model saved to: {final_path}")
+
+
+if __name__ == "__main__":
+    # Set multiprocessing start method for CUDA compatibility
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    parser = argparse.ArgumentParser(description="Train SynthSR++ model with MONAI")
+
+    # Data source arguments
+    parser.add_argument(
+        "--hr_image_dir",
+        type=str,
+        default=None,
+        help="Directory containing high-resolution images",
+    )
+    parser.add_argument(
+        "--csv_file", type=str, default=None, help="CSV file with image metadata"
+    )
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        default=None,
+        help="Base directory for relative paths in CSV",
+    )
+    parser.add_argument(
+        "--model_dir", type=str, required=True, help="Directory to save trained models"
+    )
+
+    # Model and data parameters
+    parser.add_argument(
+        "--output_shape",
+        type=int,
+        nargs=3,
+        default=[128, 128, 128],
+        help="Output volume shape",
+    )
+    parser.add_argument(
+        "--atlas_res",
+        type=float,
+        nargs=3,
+        default=[1.0, 1.0, 1.0],
+        help="Physical resolution of input HR images [x, y, z] in mm",
+    )
+    parser.add_argument(
+        "--min_resolution",
+        type=float,
+        nargs=3,
+        default=[1.0, 1.0, 1.0],
+        help="Minimum resolution for randomization [x, y, z] in mm",
+    )
+    parser.add_argument(
+        "--max_res_aniso",
+        type=float,
+        nargs=3,
+        default=[9.0, 9.0, 9.0],
+        help="Maximum anisotropic resolution [x, y, z] in mm",
+    )
+
+    # Augmentation flags
+    parser.add_argument(
+        "--no_randomise_res",
+        action="store_true",
+        help="Disable resolution randomization",
+    )
+    parser.add_argument(
+        "--no_lr_deformation", action="store_true", help="Disable LR deformation"
+    )
+    parser.add_argument(
+        "--no_bias_field", action="store_true", help="Disable bias field corruption"
+    )
+    parser.add_argument(
+        "--no_intensity_aug", action="store_true", help="Disable intensity augmentation"
+    )
+    parser.add_argument(
+        "--enable_90_rotations", action="store_true", help="Enable 90-degree rotations"
+    )
+    parser.add_argument(
+        "--disable_clip", action="store_true", help="Disable clipping to [0, 1] range"
+    )
+
+    # Training parameters
+    parser.add_argument(
+        "--epochs", type=int, default=100, help="Number of training epochs"
+    )
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument(
+        "--learning_rate", type=float, default=1e-4, help="Learning rate"
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device: cuda or cpu"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume training",
+    )
+    parser.add_argument(
+        "--save_interval", type=int, default=10, help="Save checkpoint every N epochs"
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of data loading workers (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--use_cache",
+        action="store_true",
+        help="Use MONAI CacheDataset for faster loading (caches preprocessed images)",
+    )
+
+    # Validation arguments
+    parser.add_argument(
+        "--val_image_dir",
+        type=str,
+        default=None,
+        help="Optional validation images directory",
+    )
+
+    args = parser.parse_args()
+
+    # Check device availability
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        args.device = "cpu"
+
+    # Get training image paths
+    hr_image_paths = get_image_paths(
+        image_dir=args.hr_image_dir,
+        csv_file=args.csv_file,
+        base_dir=args.base_dir,
+        split="train",
+        model_dir=args.model_dir,
+    )
+
+    # Get validation image paths if needed
+    val_image_paths = None
+    if args.val_image_dir or args.csv_file:
+        val_image_paths = get_image_paths(
+            image_dir=args.val_image_dir,
+            csv_file=args.csv_file,
+            base_dir=args.base_dir,
+            split="val",
+            model_dir=args.model_dir,
+        )
+
+    # Create model directory
+    os.makedirs(args.model_dir, exist_ok=True)
+
+    # Save training configuration
+    save_training_config(
+        model_dir=args.model_dir,
+        args=args,
+        n_train_samples=len(hr_image_paths),
+        n_val_samples=len(val_image_paths) if val_image_paths else 0,
+        training_stage="stage1",
+    )
+
+    # Train regression UNet
+    train_regression_model(
+        hr_image_paths=hr_image_paths,
+        model_dir=args.model_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        output_shape=tuple(args.output_shape),
+        checkpoint=args.checkpoint,
+        device=args.device,
+        save_interval=args.save_interval,
+        val_image_paths=val_image_paths,
+        atlas_res=args.atlas_res,
+        min_resolution=args.min_resolution,
+        max_res_aniso=args.max_res_aniso,
+        randomise_res=not args.no_randomise_res,
+        apply_lr_deformation=not args.no_lr_deformation,
+        apply_bias_field=not args.no_bias_field,
+        apply_intensity_aug=not args.no_intensity_aug,
+        enable_90_rotations=args.enable_90_rotations,
+        clip_to_unit_range=not args.disable_clip,
+        num_workers=args.num_workers,
+        use_cache=args.use_cache,
+    )
