@@ -22,6 +22,7 @@ from monai.transforms import (
     ToTensord,
     GaussianSmooth,
     ScaleIntensityRangePercentiles,
+    CenterSpatialCropd,
 )
 
 from .domain_rand import (
@@ -368,6 +369,61 @@ class HRLRDataGenerator:
             return lr_images
 
 
+class GeneratorDataset(torch.utils.data.Dataset):
+    """
+    Wrapper dataset that generates LR-HR pairs on-the-fly.
+
+    Takes preprocessed HR images from the base MONAI dataset and applies
+    HRLRDataGenerator to create paired LR-HR training data.
+    """
+
+    def __init__(self, base_dataset, generator, return_resolution):
+        self.base_dataset = base_dataset
+        self.generator = generator
+        self.return_resolution = return_resolution
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        """
+        Get LR-HR pair for training.
+
+        Returns:
+            If return_resolution=False:
+                (lr_image, hr_image): Tuple of tensors, each (C, D, H, W)
+            If return_resolution=True:
+                (lr_image, hr_image, resolution, thickness)
+        """
+        data = self.base_dataset[idx]
+        hr_image = data["image"]
+
+        # Ensure proper shape (B, C, D, H, W) for generator
+        if hr_image.ndim == 3:
+            hr_image = hr_image.unsqueeze(0)
+        hr_image = hr_image.unsqueeze(0)  # Add batch dim
+
+        # Generate paired data
+        result = self.generator.generate_paired_data(
+            hr_image,
+            return_resolution=self.return_resolution,
+        )
+
+        # Unpack and remove batch dimension
+        if self.return_resolution:
+            lr_image, hr_augmented, resolution, thickness = result
+            lr_image = lr_image.squeeze(0)
+            hr_augmented = hr_augmented.squeeze(0)
+            resolution = resolution.squeeze(0)
+            thickness = thickness.squeeze(0)
+            return lr_image, hr_augmented, resolution, thickness
+        else:
+            lr_image, hr_augmented = result
+            lr_image = lr_image.squeeze(0)
+            hr_augmented = hr_augmented.squeeze(0)
+            return lr_image, hr_augmented
+
+
 def create_dataset(
     image_paths: List[str],
     generator: HRLRDataGenerator,
@@ -458,20 +514,24 @@ def create_dataset(
 
     # Crop/pad to target shape
     if target_shape is not None:
-        transforms.extend(
-            [
-                CropForegroundd(keys=["image"], source_key="image"),
-                # Use random crop for training, center crop for validation
-                (
-                    RandSpatialCropd(
-                        keys=["image"], roi_size=target_shape, random_size=False
-                    )
-                    if is_training
-                    else SpatialPadd(keys=["image"], spatial_size=target_shape)
-                ),
-                SpatialPadd(keys=["image"], spatial_size=target_shape),
-            ]
-        )
+        transforms.append(CropForegroundd(keys=["image"], source_key="image"))
+
+        if is_training:
+            # Training: random crop, then pad if needed
+            transforms.append(
+                RandSpatialCropd(
+                    keys=["image"], roi_size=target_shape, random_size=False
+                )
+            )
+            transforms.append(SpatialPadd(keys=["image"], spatial_size=target_shape))
+        else:
+            # Validation: center crop or pad to exact target shape
+            # First try to crop to target shape (if image is larger)
+            transforms.append(
+                CenterSpatialCropd(keys=["image"], roi_size=target_shape)
+            )
+            # Then pad if needed (if image is smaller after crop)
+            transforms.append(SpatialPadd(keys=["image"], spatial_size=target_shape))
 
     transforms.append(ToTensord(keys=["image"]))
 
@@ -488,59 +548,5 @@ def create_dataset(
     else:
         dataset = Dataset(data=data_dicts, transform=transform)
 
-    # Wrap with generator for LR-HR pair generation
-    class GeneratorDataset(torch.utils.data.Dataset):
-        """
-        Wrapper dataset that generates LR-HR pairs on-the-fly.
-
-        Takes preprocessed HR images from the base MONAI dataset and applies
-        HRLRDataGenerator to create paired LR-HR training data.
-        """
-
-        def __init__(self, base_dataset, generator, return_resolution):
-            self.base_dataset = base_dataset
-            self.generator = generator
-            self.return_resolution = return_resolution
-
-        def __len__(self):
-            return len(self.base_dataset)
-
-        def __getitem__(self, idx):
-            """
-            Get LR-HR pair for training.
-
-            Returns:
-                If return_resolution=False:
-                    (lr_image, hr_image): Tuple of tensors, each (C, D, H, W)
-                If return_resolution=True:
-                    (lr_image, hr_image, resolution, thickness)
-            """
-            data = self.base_dataset[idx]
-            hr_image = data["image"]
-
-            # Ensure proper shape (B, C, D, H, W) for generator
-            if hr_image.ndim == 3:
-                hr_image = hr_image.unsqueeze(0)
-            hr_image = hr_image.unsqueeze(0)  # Add batch dim
-
-            # Generate paired data
-            result = self.generator.generate_paired_data(
-                hr_image,
-                return_resolution=self.return_resolution,
-            )
-
-            # Unpack and remove batch dimension
-            if self.return_resolution:
-                lr_image, hr_augmented, resolution, thickness = result
-                lr_image = lr_image.squeeze(0)
-                hr_augmented = hr_augmented.squeeze(0)
-                resolution = resolution.squeeze(0)
-                thickness = thickness.squeeze(0)
-                return lr_image, hr_augmented, resolution, thickness
-            else:
-                lr_image, hr_augmented = result
-                lr_image = lr_image.squeeze(0)
-                hr_augmented = hr_augmented.squeeze(0)
-                return lr_image, hr_augmented
-
+    # Wrap with generator for LR-HR pair generation (using module-level class)
     return GeneratorDataset(dataset, generator, return_resolution)

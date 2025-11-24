@@ -147,7 +147,8 @@ class RandomSpatialDeformation(nn.Module):
         outputs = []
 
         for b in range(batch_size):
-            img = image[b : b + 1]
+            # Extract single sample without batch dimension (C, D, H, W)
+            img = image[b]
 
             # Apply 90-degree rotations if enabled
             if self.enable_90_rotations:
@@ -155,16 +156,16 @@ class RandomSpatialDeformation(nn.Module):
                     k = torch.randint(0, 4, (1,)).item()
                     if k > 0:
                         if axis == 0:  # Rotate in D-H plane
-                            img = torch.rot90(img, k=k, dims=(2, 3))
+                            img = torch.rot90(img, k=k, dims=(1, 2))
                         elif axis == 1:  # Rotate in D-W plane
-                            img = torch.rot90(img, k=k, dims=(2, 4))
+                            img = torch.rot90(img, k=k, dims=(1, 3))
                         else:  # Rotate in H-W plane
-                            img = torch.rot90(img, k=k, dims=(3, 4))
+                            img = torch.rot90(img, k=k, dims=(2, 3))
 
-            # Apply affine and elastic transforms
+            # Apply affine and elastic transforms (MONAI expects C, D, H, W)
             img = self.affine_transform(img)
             img = self.elastic_transform(img)
-            outputs.append(img)
+            outputs.append(img.unsqueeze(0))
 
         return torch.cat(outputs, dim=0)
 
@@ -245,7 +246,8 @@ class BiasFieldCorruption(nn.Module):
 
             # Upsample to image size (creates smooth bias field)
             resize_transform = Resize(spatial_size=spatial_shape, mode="trilinear")
-            bias_field = resize_transform(bias_coeffs)
+            # Resize expects input without batch dimension (C, D, H, W)
+            bias_field = resize_transform(bias_coeffs.squeeze(0)).unsqueeze(0)
 
             # Convert to multiplicative field and apply
             bias_field = torch.exp(bias_field)
@@ -670,7 +672,8 @@ class MimicAcquisition(nn.Module):
             )
             if (sigma > 0.1).any():
                 smooth = GaussianSmooth(sigma=sigma.cpu().numpy().tolist())
-                img = smooth(img)
+                # GaussianSmooth expects input without batch dimension (C, D, H, W)
+                img = smooth(img.squeeze(0)).unsqueeze(0)
 
             # 2. Downsample to simulated acquisition resolution
             factor = acq_res.to(device) / self.volume_res.to(device)
@@ -679,7 +682,8 @@ class MimicAcquisition(nn.Module):
             )
             new_size = (original_size / factor).long().clamp(min=1).tolist()
             resize_down = Resize(spatial_size=new_size, mode="trilinear")
-            img = resize_down(img)
+            # Resize expects input without batch dimension (C, D, H, W)
+            img = resize_down(img.squeeze(0)).unsqueeze(0)
 
             # 3. Add Gaussian noise (simulates scanner noise)
             if self.noise_std > 0:
@@ -687,7 +691,8 @@ class MimicAcquisition(nn.Module):
 
             # 4. Upsample back to target shape (simulates reconstruction)
             resize_up = Resize(spatial_size=self.output_shape, mode="trilinear")
-            img = resize_up(img)
+            # Resize expects input without batch dimension (C, D, H, W)
+            img = resize_up(img.squeeze(0)).unsqueeze(0)
             outputs.append(img)
 
         result = torch.cat(outputs, dim=0)

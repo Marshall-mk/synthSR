@@ -9,6 +9,7 @@ from typing import List
 
 # MONAI imports
 from monai.data import DataLoader
+from monai.losses import SSIMLoss as MonaiSSIM
 
 # Import our modules
 from src.model import UNet3D
@@ -21,12 +22,96 @@ from src.utils import (
 from src.data import HRLRDataGenerator, create_dataset
 
 
+class SSIMLoss(nn.Module):
+    """SSIM loss for 3D images using MONAI's implementation."""
+
+    def __init__(self):
+        super().__init__()
+        self.ssim = MonaiSSIM(spatial_dims=3)
+
+    def forward(self, pred, target):
+        return self.ssim(pred, target)
+
+
+def get_loss_function(loss_name: str):
+    """
+    Get loss function by name.
+
+    Args:
+        loss_name: Name of loss function (l1, l2, huber, ssim, gaussian_nll)
+
+    Returns:
+        PyTorch loss function
+    """
+    if loss_name == "l1":
+        return nn.L1Loss()
+    elif loss_name == "l2":
+        return nn.MSELoss()
+    elif loss_name == "huber":
+        return nn.HuberLoss(delta=1.0)
+    elif loss_name == "ssim":
+        return SSIMLoss()
+    elif loss_name == "gaussian_nll":
+        # For Gaussian NLL, we need to predict both mean and variance
+        # This requires model architecture changes, so we'll use MSE as fallback
+        print(
+            "Warning: Gaussian NLL requires model changes (predicting variance). Using MSE instead."
+        )
+        return nn.MSELoss()
+    else:
+        raise ValueError(f"Unknown loss function: {loss_name}")
+
+
+def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0):
+    """
+    Calculate evaluation metrics.
+
+    Args:
+        pred: Predicted images (B, C, D, H, W)
+        target: Target images (B, C, D, H, W)
+        max_val: Maximum pixel value for PSNR calculation (default: 1.0)
+
+    Returns:
+        Dictionary of metrics
+    """
+    with torch.no_grad():
+        # MAE (L1)
+        mae = torch.abs(pred - target).mean().item()
+
+        # MSE (L2)
+        mse = ((pred - target) ** 2).mean().item()
+
+        # RMSE
+        rmse = torch.sqrt(torch.tensor(mse)).item()
+
+        # PSNR (Peak Signal-to-Noise Ratio)
+        if mse > 0:
+            psnr = 10 * torch.log10(torch.tensor(max_val**2 / mse)).item()
+        else:
+            psnr = float("inf")
+
+        # R² (Coefficient of Determination)
+        target_mean = target.mean()
+        ss_tot = ((target - target_mean) ** 2).sum().item()
+        ss_res = ((target - pred) ** 2).sum().item()
+        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        return {
+            "mae": mae,
+            "mse": mse,
+            "rmse": rmse,
+            "psnr": psnr,
+            "r2": r2,
+        }
+
+
 def train_regression_model(
     hr_image_paths: List[str],
     model_dir: str,
     epochs: int = 100,
     batch_size: int = 1,
     learning_rate: float = 1e-4,
+    loss_name: str = "l1",
     output_shape: tuple = (128, 128, 128),
     checkpoint: str = None,
     device: str = "cuda",
@@ -123,7 +208,7 @@ def train_regression_model(
         target_shape=list(output_shape),
         target_spacing=atlas_res,
         use_cache=use_cache,
-        return_resolution=False,
+        return_resolution=True,  # Return resolution for logging
         is_training=True,
     )
 
@@ -148,7 +233,7 @@ def train_regression_model(
             target_shape=list(output_shape),
             target_spacing=atlas_res,
             use_cache=use_cache,
-            return_resolution=False,
+            return_resolution=True,  # Return resolution for logging
             is_training=False,
         )
 
@@ -199,7 +284,8 @@ def train_regression_model(
 
     # Optimizer and loss
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.L1Loss()
+    criterion = get_loss_function(loss_name)
+    print(f"Using loss function: {loss_name}")
 
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -226,10 +312,37 @@ def train_regression_model(
         epoch_loss = 0.0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
-        for batch_idx, (input_img, target_img) in enumerate(pbar):
+        for batch_idx, (input_img, target_img, resolution, thickness) in enumerate(pbar):
             # Move to device
             input_img = input_img.to(device)
             target_img = target_img.to(device)
+            resolution = resolution.to(device)
+            thickness = thickness.to(device)
+
+            # # Log shapes and resolution every 50 batches
+            # # if batch_idx % 50 == 0:
+            # print(f"\nBatch {batch_idx}: Input shape: {input_img.shape}, Target shape: {target_img.shape}")
+            # print(f"Resolution: {resolution.cpu().numpy().flatten()}, Thickness: {thickness.cpu().numpy().flatten()}")
+            # print(f"Input range: [{input_img.min().item():.4f}, {input_img.max().item():.4f}], Target range: [{target_img.min().item():.4f}, {target_img.max().item():.4f}]")
+
+            # # Save intermediate input and target images for debugging
+            # import nibabel as nib
+            # import numpy as np
+
+            # # Save each image in the batch separately
+            # for b in range(input_img.shape[0]):
+            #     # Index batch first, then remove channel dimension
+            #     input_img_np = input_img[b].squeeze(0).cpu().numpy()  # Shape: (128, 128, 128)
+            #     target_img_np = target_img[b].squeeze(0).cpu().numpy()  # Shape: (128, 128, 128)
+
+            #     input_nii = nib.Nifti1Image(input_img_np, np.eye(4))
+            #     target_nii = nib.Nifti1Image(target_img_np, np.eye(4))
+
+            #     # Include batch index in filename
+            #     nib.save(input_nii, f"debug_input_epoch{epoch+1}_batch{batch_idx+1}_sample{b+1}.nii.gz")
+            #     nib.save(target_nii, f"debug_target_epoch{epoch+1}_batch{batch_idx+1}_sample{b+1}.nii.gz")
+
+            # break  # --- DEBUGGING ONLY ---
 
             # Forward pass
             output = model(input_img)
@@ -247,20 +360,46 @@ def train_regression_model(
 
         # Validation
         val_loss = None
+        val_metrics = None
         if val_dataloader:
             model.eval()
             val_epoch_loss = 0.0
+            # Accumulate metrics across validation set
+            metrics_sum = {
+                "mae": 0.0,
+                "mse": 0.0,
+                "rmse": 0.0,
+                "psnr": 0.0,
+                "r2": 0.0,
+            }
+            num_val_batches = 0
+
             with torch.no_grad():
-                for input_img, target_img in val_dataloader:
+                for input_img, target_img, resolution, thickness in val_dataloader:
                     input_img = input_img.to(device)
                     target_img = target_img.to(device)
                     output = model(input_img)
                     loss = criterion(output, target_img)
                     val_epoch_loss += loss.item()
+
+                    # Calculate metrics for this batch
+                    batch_metrics = calculate_metrics(output, target_img, max_val=1.0)
+                    for key in metrics_sum:
+                        metrics_sum[key] += batch_metrics[key]
+                    num_val_batches += 1
+
             val_loss = val_epoch_loss / len(val_dataloader)
+
+            # Average metrics across batches
+            val_metrics = {k: v / num_val_batches for k, v in metrics_sum.items()}
+
             print(
-                f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - "
-                f"Val Loss: {val_loss:.4f} - LR: {optimizer.param_groups[0]['lr']:.2e}"
+                f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - Val Loss: {val_loss:.4f}"
+            )
+            print(
+                f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | MSE: {val_metrics['mse']:.6f} | "
+                f"RMSE: {val_metrics['rmse']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB | "
+                f"R²: {val_metrics['r2']:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
         else:
             print(
@@ -413,6 +552,13 @@ if __name__ == "__main__":
         "--learning_rate", type=float, default=1e-4, help="Learning rate"
     )
     parser.add_argument(
+        "--loss",
+        type=str,
+        default="l1",
+        choices=["l1", "l2", "huber", "ssim", "gaussian_nll"],
+        help="Loss function: l1 (MAE), l2 (MSE), huber, ssim, or gaussian_nll",
+    )
+    parser.add_argument(
         "--device", type=str, default="cuda", help="Device: cuda or cpu"
     )
     parser.add_argument(
@@ -490,6 +636,7 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        loss_name=args.loss,
         output_shape=tuple(args.output_shape),
         checkpoint=args.checkpoint,
         device=args.device,

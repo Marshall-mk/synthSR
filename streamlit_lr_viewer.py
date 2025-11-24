@@ -25,7 +25,7 @@ from src.domain_rand import (
 # Page config
 st.set_page_config(page_title="LR Pipeline Viewer", layout="wide")
 
-st.title("🔬 Low-Resolution Creation Pipeline Viewer (MONAI)")
+st.title("🔬 Low-Resolution Creation Pipeline Viewer")
 st.markdown("Interactively tune all parameters and visualize the results")
 
 # Session state for caching
@@ -54,9 +54,10 @@ def apply_pipeline(hr_image, params):
     Apply the LR creation pipeline with given parameters.
 
     Mimics the HRLRDataGenerator pipeline but with interactive parameters.
-    Returns both the transformed image and logs of min/max values at each step.
+    Returns the normalized HR image, transformed LR image, and logs of min/max values at each step.
     """
     device = hr_image.device
+    hr_image = hr_image.clone()  # Clone HR to avoid modifying the original
     lr_image = hr_image.clone()
 
     # Initialize logging
@@ -156,7 +157,8 @@ def apply_pipeline(hr_image, params):
         # Apply fixed blur after intensity aug (as in pipeline)
         if params["apply_fixed_blur"]:
             fixed_blur = GaussianSmooth(sigma=params["fixed_blur_sigma"])
-            lr_image = fixed_blur(lr_image)
+            # GaussianSmooth expects input without batch dimension (C, D, H, W)
+            lr_image = fixed_blur(lr_image.squeeze(0)).unsqueeze(0)
             logs.append(
                 {
                     "step": "3b. After Fixed Blur",
@@ -173,14 +175,15 @@ def apply_pipeline(hr_image, params):
             }
         )
 
-    # 4. Normalize before resolution simulation
+    # 4. Normalize before resolution simulation (normalize both HR and LR)
     normalizer = ScaleIntensityRangePercentiles(
         lower=0, upper=100, b_min=0.0, b_max=1.0, clip=True
     )
+    hr_image = normalizer(hr_image)  # Normalize HR image too
     lr_image = normalizer(lr_image)
     logs.append(
         {
-            "step": "4. After Normalization [0,1]",
+            "step": "4. After Normalization [0,1] (HR and LR both normalized)",
             "min": lr_image.min().item(),
             "max": lr_image.max().item(),
         }
@@ -245,7 +248,7 @@ def apply_pipeline(hr_image, params):
             }
         )
 
-    return lr_image, logs
+    return hr_image, lr_image, logs
 
 
 # Sidebar - File Selection
@@ -508,7 +511,7 @@ if st.session_state.hr_image is not None:
             st.rerun()
 
     with st.spinner("Generating LR image..."):
-        lr_image, intensity_logs = apply_pipeline(hr_image, params)
+        hr_image, lr_image, intensity_logs = apply_pipeline(hr_image, params)
 
     # Display intensity range logs
     st.markdown("### 📊 Intensity Range at Each Pipeline Step")
@@ -623,10 +626,18 @@ if st.session_state.hr_image is not None:
         mae = np.abs(hr_np - lr_np).mean()
         st.metric("MAE", f"{mae:.4f}")
 
-    with stat_col4:
         mse = ((hr_np - lr_np) ** 2).mean()
+        st.metric("MSE", f"{mse:.6f}")
+
+    with stat_col4:
         rmse = np.sqrt(mse)
         st.metric("RMSE", f"{rmse:.4f}")
+
+        # R² (coefficient of determination)
+        ss_res = np.sum((hr_np - lr_np) ** 2)
+        ss_tot = np.sum((hr_np - hr_np.mean()) ** 2)
+        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        st.metric("R²", f"{r2:.4f}")
 
     with stat_col5:
         # PSNR (assume max value is 1.0 since normalized)
@@ -635,6 +646,29 @@ if st.session_state.hr_image is not None:
             st.metric("PSNR (dB)", f"{psnr:.2f}")
         else:
             st.metric("PSNR (dB)", "∞")
+
+    # Display acquisition parameters used
+    if params["apply_resolution_randomization"]:
+        st.markdown("---")
+        st.subheader("🎯 Acquisition Parameters Used")
+
+        acq_col1, acq_col2 = st.columns(2)
+
+        with acq_col1:
+            st.markdown("**Resolution (mm)**")
+            st.code(
+                f"X: {params['res_x']:.2f} mm\n"
+                f"Y: {params['res_y']:.2f} mm\n"
+                f"Z: {params['res_z']:.2f} mm"
+            )
+
+        with acq_col2:
+            st.markdown("**Slice Thickness (mm)**")
+            st.code(
+                f"X: {params['thick_x']:.2f} mm\n"
+                f"Y: {params['thick_y']:.2f} mm\n"
+                f"Z: {params['thick_z']:.2f} mm"
+            )
 
     # Save option
     st.markdown("---")
