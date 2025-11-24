@@ -1,15 +1,16 @@
 import os
 import argparse
+import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
+from datetime import datetime
 from tqdm import tqdm
 from typing import List
 
 # MONAI imports
 from monai.data import DataLoader
-from monai.losses import SSIMLoss as MonaiSSIM
 
 # Import our modules
 from src.model import UNet3D
@@ -18,91 +19,10 @@ from src.utils import (
     get_image_paths,
     save_training_config,
     find_latest_checkpoint,
+    get_loss_function,
+    calculate_metrics,
 )
 from src.data import HRLRDataGenerator, create_dataset
-
-
-class SSIMLoss(nn.Module):
-    """SSIM loss for 3D images using MONAI's implementation."""
-
-    def __init__(self):
-        super().__init__()
-        self.ssim = MonaiSSIM(spatial_dims=3)
-
-    def forward(self, pred, target):
-        return self.ssim(pred, target)
-
-
-def get_loss_function(loss_name: str):
-    """
-    Get loss function by name.
-
-    Args:
-        loss_name: Name of loss function (l1, l2, huber, ssim, gaussian_nll)
-
-    Returns:
-        PyTorch loss function
-    """
-    if loss_name == "l1":
-        return nn.L1Loss()
-    elif loss_name == "l2":
-        return nn.MSELoss()
-    elif loss_name == "huber":
-        return nn.HuberLoss(delta=1.0)
-    elif loss_name == "ssim":
-        return SSIMLoss()
-    elif loss_name == "gaussian_nll":
-        # For Gaussian NLL, we need to predict both mean and variance
-        # This requires model architecture changes, so we'll use MSE as fallback
-        print(
-            "Warning: Gaussian NLL requires model changes (predicting variance). Using MSE instead."
-        )
-        return nn.MSELoss()
-    else:
-        raise ValueError(f"Unknown loss function: {loss_name}")
-
-
-def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0):
-    """
-    Calculate evaluation metrics.
-
-    Args:
-        pred: Predicted images (B, C, D, H, W)
-        target: Target images (B, C, D, H, W)
-        max_val: Maximum pixel value for PSNR calculation (default: 1.0)
-
-    Returns:
-        Dictionary of metrics
-    """
-    with torch.no_grad():
-        # MAE (L1)
-        mae = torch.abs(pred - target).mean().item()
-
-        # MSE (L2)
-        mse = ((pred - target) ** 2).mean().item()
-
-        # RMSE
-        rmse = torch.sqrt(torch.tensor(mse)).item()
-
-        # PSNR (Peak Signal-to-Noise Ratio)
-        if mse > 0:
-            psnr = 10 * torch.log10(torch.tensor(max_val**2 / mse)).item()
-        else:
-            psnr = float("inf")
-
-        # R² (Coefficient of Determination)
-        target_mean = target.mean()
-        ss_tot = ((target - target_mean) ** 2).sum().item()
-        ss_res = ((target - pred) ** 2).sum().item()
-        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-        return {
-            "mae": mae,
-            "mse": mse,
-            "rmse": rmse,
-            "psnr": psnr,
-            "r2": r2,
-        }
 
 
 def train_regression_model(
@@ -306,6 +226,28 @@ def train_regression_model(
     print(f"Initial learning rate: {learning_rate}")
     print(f"Device: {device}")
 
+    # Setup CSV logging with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"training_log_{timestamp}.csv"
+    csv_path = os.path.join(model_dir, csv_filename)
+    csv_exists = os.path.exists(csv_path)
+
+    # Define CSV headers
+    csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate"]
+    if val_dataloader:
+        csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2"])
+
+    # Open CSV file for writing (append if resuming training)
+    csv_file = open(csv_path, mode='a', newline='')
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
+
+    # Write header if file is new
+    if not csv_exists or os.path.getsize(csv_path) == 0:
+        csv_writer.writeheader()
+        csv_file.flush()
+
+    print(f"Logging training metrics to: {csv_path}")
+
     # Training loop
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -410,6 +352,27 @@ def train_regression_model(
         # Update learning rate scheduler
         scheduler.step(val_loss if val_loss is not None else avg_loss)
 
+        # Log metrics to CSV
+        log_data = {
+            "epoch": epoch + 1,
+            "loss_type": loss_name,
+            "train_loss": avg_loss,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        }
+
+        if val_dataloader and val_loss is not None and val_metrics is not None:
+            log_data.update({
+                "val_loss": val_loss,
+                "val_mae": val_metrics['mae'],
+                "val_mse": val_metrics['mse'],
+                "val_rmse": val_metrics['rmse'],
+                "val_psnr": val_metrics['psnr'],
+                "val_r2": val_metrics['r2']
+            })
+
+        csv_writer.writerow(log_data)
+        csv_file.flush()  # Ensure data is written immediately
+
         # Save checkpoint at specified intervals
         if (epoch + 1) % save_interval == 0:
             checkpoint_path = os.path.join(
@@ -437,6 +400,10 @@ def train_regression_model(
                 scheduler_state_dict=scheduler.state_dict(),
             )
             print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Close CSV file
+    csv_file.close()
+    print(f"Training log saved to: {csv_path}")
 
     # Save final model
     final_path = os.path.join(model_dir, "regression_unet_final.pth")

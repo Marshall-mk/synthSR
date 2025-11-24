@@ -58,7 +58,7 @@ results/
 experiments/
 wandb/
 tensorboard/
-**/*model*/
+
 
 # Documentation
 docs/

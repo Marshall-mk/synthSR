@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Dict, Any, Optional, List, Union
 
+from monai.losses import SSIMLoss as MonaiSSIM
+
 from .model import UNet3D
 
 
@@ -572,3 +574,91 @@ def save_training_config(
         json.dump(config, f, indent=2)
 
     print(f"Training configuration saved to: {config_path}")
+
+
+# =============================================================================
+# Loss Functions and Metrics
+# =============================================================================
+
+
+class SSIMLoss(nn.Module):
+    """SSIM loss for 3D images using MONAI's implementation."""
+
+    def __init__(self):
+        super().__init__()
+        self.ssim = MonaiSSIM(spatial_dims=3)
+
+    def forward(self, pred, target):
+        return self.ssim(pred, target)
+
+
+def get_loss_function(loss_name: str):
+    """
+    Get loss function by name.
+
+    Args:
+        loss_name: Name of loss function (l1, l2, huber, ssim, gaussian_nll)
+
+    Returns:
+        PyTorch loss function
+    """
+    if loss_name == "l1":
+        return nn.L1Loss()
+    elif loss_name == "l2":
+        return nn.MSELoss()
+    elif loss_name == "huber":
+        return nn.HuberLoss(delta=1.0)
+    elif loss_name == "ssim":
+        return SSIMLoss()
+    elif loss_name == "gaussian_nll":
+        # For Gaussian NLL, we need to predict both mean and variance
+        # This requires model architecture changes, so we'll use MSE as fallback
+        print(
+            "Warning: Gaussian NLL requires model changes (predicting variance). Using MSE instead."
+        )
+        return nn.MSELoss()
+    else:
+        raise ValueError(f"Unknown loss function: {loss_name}")
+
+
+def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0):
+    """
+    Calculate evaluation metrics.
+
+    Args:
+        pred: Predicted images (B, C, D, H, W)
+        target: Target images (B, C, D, H, W)
+        max_val: Maximum pixel value for PSNR calculation (default: 1.0)
+
+    Returns:
+        Dictionary of metrics
+    """
+    with torch.no_grad():
+        # MAE (L1)
+        mae = torch.abs(pred - target).mean().item()
+
+        # MSE (L2)
+        mse = ((pred - target) ** 2).mean().item()
+
+        # RMSE
+        rmse = torch.sqrt(torch.tensor(mse)).item()
+
+        # PSNR (Peak Signal-to-Noise Ratio)
+        if mse > 0:
+            psnr = 10 * torch.log10(torch.tensor(max_val**2 / mse)).item()
+        else:
+            psnr = float("inf")
+
+        # R² (Coefficient of Determination)
+        target_mean = target.mean()
+        ss_tot = ((target - target_mean) ** 2).sum().item()
+        ss_res = ((target - pred) ** 2).sum().item()
+        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        return {
+            "mae": mae,
+            "mse": mse,
+            "rmse": rmse,
+            "psnr": psnr,
+            "r2": r2,
+        }
