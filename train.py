@@ -1,6 +1,7 @@
 import os
 import argparse
 import csv
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -21,6 +22,7 @@ from src.utils import (
     find_latest_checkpoint,
     get_loss_function,
     calculate_metrics,
+    sliding_window_inference,
 )
 from src.data import HRLRDataGenerator, create_dataset
 
@@ -48,6 +50,9 @@ def train_regression_model(
     clip_to_unit_range: bool = True,
     num_workers: int = None,
     use_cache: bool = False,
+    use_sliding_window_val: bool = False,
+    sw_overlap: float = 0.5,
+    sw_batch_size: int = 4,
 ):
     """
     Stage 1: Train regression UNet
@@ -74,6 +79,10 @@ def train_regression_model(
         clip_to_unit_range: Whether to clip images to [0, 1] range
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
+        use_sliding_window_val: If True, use sliding window inference for validation
+            to get accurate full-volume metrics. Slower but more representative.
+        sw_overlap: Overlap for sliding window validation (default: 0.5)
+        sw_batch_size: Batch size for sliding window patches (default: 4)
     """
     print("=" * 80)
     print("STAGE 1: Training Regression UNet")
@@ -233,9 +242,9 @@ def train_regression_model(
     csv_exists = os.path.exists(csv_path)
 
     # Define CSV headers
-    csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate"]
+    csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate", "epoch_time", "data_loading_time", "forward_backward_time"]
     if val_dataloader:
-        csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2"])
+        csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "validation_time"])
 
     # Open CSV file for writing (append if resuming training)
     csv_file = open(csv_path, mode='a', newline='')
@@ -250,11 +259,22 @@ def train_regression_model(
 
     # Training loop
     for epoch in range(start_epoch, epochs):
+        epoch_start_time = time.time()
         model.train()
         epoch_loss = 0.0
 
+        # Timing accumulators
+        data_loading_time = 0.0
+        forward_backward_time = 0.0
+        batch_start_time = time.time()
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
         for batch_idx, (input_img, target_img, resolution, thickness) in enumerate(pbar):
+            # Data loading time
+            data_loading_time += time.time() - batch_start_time
+
+            model_start_time = time.time()
+
             # Move to device
             input_img = input_img.to(device)
             target_img = target_img.to(device)
@@ -296,14 +316,23 @@ def train_regression_model(
             optimizer.step()
 
             epoch_loss += loss.item()
+
+            # Forward/backward time
+            forward_backward_time += time.time() - model_start_time
+
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            # Start timing for next batch data loading
+            batch_start_time = time.time()
 
         avg_loss = epoch_loss / len(dataloader)
 
         # Validation
         val_loss = None
         val_metrics = None
+        validation_time = 0.0
         if val_dataloader:
+            val_start_time = time.time()
             model.eval()
             val_epoch_loss = 0.0
             # Accumulate metrics across validation set
@@ -317,24 +346,61 @@ def train_regression_model(
             num_val_batches = 0
 
             with torch.no_grad():
-                for input_img, target_img, resolution, thickness in val_dataloader:
-                    input_img = input_img.to(device)
-                    target_img = target_img.to(device)
-                    output = model(input_img)
-                    loss = criterion(output, target_img)
-                    val_epoch_loss += loss.item()
+                if use_sliding_window_val:
+                    # Use sliding window inference for accurate full-volume validation
+                    print(f"\n  Running sliding window validation...")
+                    for input_img, target_img, resolution, thickness in val_dataloader:
+                        input_img = input_img.to(device)
+                        target_img = target_img.to(device)
 
-                    # Calculate metrics for this batch
-                    batch_metrics = calculate_metrics(output, target_img, max_val=1.0)
-                    for key in metrics_sum:
-                        metrics_sum[key] += batch_metrics[key]
-                    num_val_batches += 1
+                        # Process each sample in batch with sliding window
+                        for b in range(input_img.shape[0]):
+                            input_sample = input_img[b:b+1]
+                            target_sample = target_img[b:b+1]
 
-            val_loss = val_epoch_loss / len(val_dataloader)
+                            # Run sliding window inference
+                            output_sample = sliding_window_inference(
+                                model=model,
+                                volume=input_sample,
+                                patch_size=output_shape,
+                                overlap=sw_overlap,
+                                batch_size=sw_batch_size,
+                                device=device,
+                                blend_mode="gaussian",
+                                progress=False,
+                            )
+
+                            # Calculate loss and metrics
+                            loss = criterion(output_sample, target_sample)
+                            val_epoch_loss += loss.item()
+
+                            batch_metrics = calculate_metrics(output_sample, target_sample, max_val=1.0)
+                            for key in metrics_sum:
+                                metrics_sum[key] += batch_metrics[key]
+                            num_val_batches += 1
+                else:
+                    # Standard patch-based validation (faster)
+                    for input_img, target_img, resolution, thickness in val_dataloader:
+                        input_img = input_img.to(device)
+                        target_img = target_img.to(device)
+                        output = model(input_img)
+                        loss = criterion(output, target_img)
+                        val_epoch_loss += loss.item()
+
+                        # Calculate metrics for this batch
+                        batch_metrics = calculate_metrics(output, target_img, max_val=1.0)
+                        for key in metrics_sum:
+                            metrics_sum[key] += batch_metrics[key]
+                        num_val_batches += 1
+
+            val_loss = val_epoch_loss / num_val_batches
 
             # Average metrics across batches
             val_metrics = {k: v / num_val_batches for k, v in metrics_sum.items()}
 
+            validation_time = time.time() - val_start_time
+
+            epoch_time = time.time() - epoch_start_time
             print(
                 f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - Val Loss: {val_loss:.4f}"
             )
@@ -343,10 +409,19 @@ def train_regression_model(
                 f"RMSE: {val_metrics['rmse']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB | "
                 f"R²: {val_metrics['r2']:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
+            print(
+                f"  Timing - Epoch: {epoch_time:.1f}s | Data: {data_loading_time:.1f}s | "
+                f"Model: {forward_backward_time:.1f}s | Val: {validation_time:.1f}s"
+            )
         else:
+            epoch_time = time.time() - epoch_start_time
             print(
                 f"Epoch {epoch + 1}/{epochs} - Average Loss: {avg_loss:.4f} - "
                 f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+            print(
+                f"  Timing - Epoch: {epoch_time:.1f}s | Data: {data_loading_time:.1f}s | "
+                f"Model: {forward_backward_time:.1f}s"
             )
 
         # Update learning rate scheduler
@@ -357,7 +432,10 @@ def train_regression_model(
             "epoch": epoch + 1,
             "loss_type": loss_name,
             "train_loss": avg_loss,
-            "learning_rate": optimizer.param_groups[0]['lr']
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch_time": epoch_time,
+            "data_loading_time": data_loading_time,
+            "forward_backward_time": forward_backward_time,
         }
 
         if val_dataloader and val_loss is not None and val_metrics is not None:
@@ -367,7 +445,8 @@ def train_regression_model(
                 "val_mse": val_metrics['mse'],
                 "val_rmse": val_metrics['rmse'],
                 "val_psnr": val_metrics['psnr'],
-                "val_r2": val_metrics['r2']
+                "val_r2": val_metrics['r2'],
+                "validation_time": validation_time,
             })
 
         csv_writer.writerow(log_data)
@@ -551,6 +630,23 @@ if __name__ == "__main__":
 
     # Validation arguments
     parser.add_argument(
+        "--use_sliding_window_val",
+        action="store_true",
+        help="Use sliding window inference for validation (accurate full-volume metrics, slower)",
+    )
+    parser.add_argument(
+        "--sw_overlap",
+        type=float,
+        default=0.5,
+        help="Overlap ratio for sliding window validation (0.0-0.9, default: 0.5)",
+    )
+    parser.add_argument(
+        "--sw_batch_size",
+        type=int,
+        default=4,
+        help="Batch size for sliding window patches during validation (default: 4)",
+    )
+    parser.add_argument(
         "--val_image_dir",
         type=str,
         default=None,
@@ -620,4 +716,7 @@ if __name__ == "__main__":
         clip_to_unit_range=not args.disable_clip,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
+        use_sliding_window_val=args.use_sliding_window_val,
+        sw_overlap=args.sw_overlap,
+        sw_batch_size=args.sw_batch_size,
     )

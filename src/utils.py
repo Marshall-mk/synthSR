@@ -662,3 +662,225 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
             "psnr": psnr,
             "r2": r2,
         }
+
+
+# =============================================================================
+# Sliding Window Inference
+# =============================================================================
+
+
+def sliding_window_inference(
+    model: nn.Module,
+    volume: torch.Tensor,
+    patch_size: tuple = (128, 128, 64),
+    overlap: float = 0.5,
+    batch_size: int = 4,
+    device: str = "cuda",
+    blend_mode: str = "gaussian",
+    progress: bool = True,
+) -> torch.Tensor:
+    """
+    Perform sliding window inference on a large 3D volume using MONAI's implementation.
+
+    Wrapper around MONAI's sliding_window_inference that divides the input volume into
+    overlapping patches, runs model inference on each patch, and reconstructs the full
+    prediction by blending overlapping regions. This enables inference on volumes larger
+    than what fits in GPU memory during training.
+
+    Args:
+        model: PyTorch model for inference (should be in eval mode)
+        volume: Input volume tensor of shape (1, C, D, H, W) or (C, D, H, W)
+        patch_size: Size of patches for inference (D, H, W)
+            Example: (128, 128, 64) for patches of 128×128×64
+        overlap: Overlap ratio between adjacent patches [0, 1)
+            - 0.0: No overlap (faster, potential edge artifacts)
+            - 0.5: 50% overlap (good balance)
+            - 0.75: 75% overlap (smoother, slower)
+        batch_size: Number of patches to process simultaneously
+            Larger = faster but more memory
+        device: Device for inference ('cuda' or 'cpu')
+        blend_mode: Method for blending overlapping patches
+            - 'gaussian': Gaussian-weighted blending (smoother, recommended)
+            - 'constant': Simple averaging
+        progress: If True, show progress bar
+
+    Returns:
+        Predicted volume of same shape as input (1, C, D, H, W) or (C, D, H, W)
+
+    Example:
+        >>> from src.utils import load_unet3d_from_checkpoint, sliding_window_inference
+        >>> model, _ = load_unet3d_from_checkpoint("model.pth", device="cuda")
+        >>> model.eval()
+        >>>
+        >>> # Full-size volume (too large for training batch)
+        >>> volume = torch.randn(1, 1, 320, 320, 128).cuda()
+        >>>
+        >>> # Predict using sliding window with 128×128×64 patches
+        >>> prediction = sliding_window_inference(
+        ...     model=model,
+        ...     volume=volume,
+        ...     patch_size=(128, 128, 64),
+        ...     overlap=0.5,
+        ...     batch_size=4,
+        ...     device="cuda"
+        ... )
+        >>> print(prediction.shape)  # (1, 1, 320, 320, 128) - same as input
+    """
+    from monai.inferers import sliding_window_inference as monai_sliding_window
+
+    # Ensure model is in eval mode
+    model.eval()
+
+    # Handle input shape
+    squeeze_output = False
+    if volume.ndim == 4:
+        volume = volume.unsqueeze(0)  # Add batch dimension
+        squeeze_output = True
+
+    batch, channels, d, h, w = volume.shape
+    if batch != 1:
+        raise ValueError(f"Batch size must be 1, got {batch}")
+
+    # Move to device
+    volume = volume.to(device)
+
+    # Print info
+    print(f"Sliding window inference on volume shape: {volume.shape}")
+    print(f"Patch size: {patch_size}, Overlap: {overlap:.1%}, Batch size: {batch_size}")
+
+    # Use MONAI's sliding window inference
+    with torch.no_grad():
+        output = monai_sliding_window(
+            inputs=volume,
+            roi_size=patch_size,
+            sw_batch_size=batch_size,
+            predictor=model,
+            overlap=overlap,
+            mode=blend_mode,  # 'gaussian' or 'constant'
+            progress=progress,
+        )
+
+    # Remove batch dimension if input didn't have it
+    if squeeze_output:
+        output = output.squeeze(0)
+
+    return output
+
+
+def predict_full_volume(
+    model: nn.Module,
+    input_path: str,
+    output_path: str,
+    patch_size: tuple = (128, 128, 64),
+    overlap: float = 0.5,
+    batch_size: int = 4,
+    device: str = "cuda",
+    target_spacing: Optional[list] = None,
+) -> None:
+    """
+    Predict on a full NIfTI volume using sliding window inference and save result.
+
+    High-level wrapper that loads an input NIfTI file, applies padding if needed,
+    runs sliding window inference, and saves the prediction as a NIfTI file with
+    the same metadata (affine, header) as the input.
+
+    Args:
+        model: Trained PyTorch model (will be set to eval mode)
+        input_path: Path to input NIfTI file (.nii or .nii.gz)
+        output_path: Path to save output NIfTI file (.nii or .nii.gz)
+        patch_size: Size of patches for inference (D, H, W)
+        overlap: Overlap ratio between patches [0, 1)
+        batch_size: Number of patches to process simultaneously
+        device: Device for inference ('cuda' or 'cpu')
+        target_spacing: Optional target voxel spacing [x, y, z] in mm
+            If provided, input will be resampled before inference
+
+    Example:
+        >>> from src.utils import load_unet3d_from_checkpoint, predict_full_volume
+        >>> model, _ = load_unet3d_from_checkpoint("model.pth", device="cuda")
+        >>>
+        >>> predict_full_volume(
+        ...     model=model,
+        ...     input_path="input_lr.nii.gz",
+        ...     output_path="output_sr.nii.gz",
+        ...     patch_size=(128, 128, 64),
+        ...     overlap=0.5,
+        ...     batch_size=4,
+        ...     device="cuda"
+        ... )
+    """
+    import nibabel as nib
+    from monai.transforms import (
+        LoadImage,
+        EnsureChannelFirst,
+        Orientation,
+        Spacing,
+        Compose,
+    )
+
+    print(f"Loading input volume: {input_path}")
+
+    # Build preprocessing pipeline
+    transforms = [
+        LoadImage(image_only=False),  # Keep metadata
+        EnsureChannelFirst(),
+        Orientation(axcodes="RAS"),
+    ]
+
+    if target_spacing is not None:
+        transforms.append(Spacing(pixdim=target_spacing, mode="bilinear"))
+
+    transform = Compose(transforms)
+
+    # Load and preprocess
+    img_obj = transform(input_path)
+    volume = img_obj[0]  # Get tensor
+    metadata = img_obj[1]  # Get metadata
+
+    # Ensure shape is (C, D, H, W)
+    if volume.ndim == 3:
+        volume = volume.unsqueeze(0)
+
+    print(f"Input volume shape: {volume.shape}")
+
+    # Normalize to [0, 1] for consistency with training
+    volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-8)
+
+    # Pad to ensure divisibility by patch size if needed
+    original_shape = volume.shape[1:]  # (D, H, W)
+    padded_volume, pad_before, orig_shape = pad_to_multiple_of_32(volume.squeeze(0).numpy())
+    padded_volume = torch.from_numpy(padded_volume).unsqueeze(0).float()
+
+    print(f"Padded volume shape: {padded_volume.shape}")
+
+    # Run sliding window inference using MONAI
+    print(f"Running sliding window inference...")
+    prediction = sliding_window_inference(
+        model=model,
+        volume=padded_volume,
+        patch_size=patch_size,
+        overlap=overlap,
+        batch_size=batch_size,
+        device=device,
+        blend_mode="gaussian",
+        progress=True,
+    )
+
+    # Remove padding
+    prediction = prediction.squeeze(0).cpu().numpy()  # (C, D, H, W) -> (D, H, W)
+    if prediction.ndim == 4:
+        prediction = prediction.squeeze(0)  # Remove channel dim
+    prediction = unpad_volume(prediction, pad_before, orig_shape)
+
+    print(f"Output volume shape: {prediction.shape}")
+
+    # Save as NIfTI with original metadata
+    affine = metadata.get("affine", np.eye(4))
+    output_nii = nib.Nifti1Image(prediction, affine=affine)
+
+    # Copy header metadata if available
+    if "original_affine" in metadata:
+        output_nii.header["pixdim"] = metadata.get("pixdim", output_nii.header["pixdim"])
+
+    nib.save(output_nii, output_path)
+    print(f"Saved prediction to: {output_path}")

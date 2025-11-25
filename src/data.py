@@ -283,7 +283,8 @@ class HRLRDataGenerator:
                 [self.atlas_res] * batch_size, dtype=torch.float32, device=device
             )
             thickness = resolution.clone()
-
+            
+        lr_images = self._normalize_image(lr_images)
         # Final clipping to ensure [0, 1] range (training stability)
         if self.clip_to_unit_range:
             lr_images = torch.clamp(lr_images, 0.0, 1.0)
@@ -548,5 +549,5 @@ def create_dataset(
     else:
         dataset = Dataset(data=data_dicts, transform=transform)
 
-    # Wrap with generator for LR-HR pair generation (using module-level class)
+    # Wrap with generator for LR-HR pair generation 
     return GeneratorDataset(dataset, generator, return_resolution)
