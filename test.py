@@ -20,11 +20,11 @@ from pathlib import Path
 
 from monai.transforms import (
     Compose,
-    LoadImage,
-    EnsureChannelFirst,
-    Orientation,
-    Spacing,
-    ScaleIntensityRangePercentiles,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRangePercentilesd,
 )
 
 from src.utils import (
@@ -46,11 +46,12 @@ def create_inference_transforms(atlas_res=[1.0, 1.0, 1.0]):
     """
     return Compose(
         [
-            LoadImage(image_only=False),  # Keep metadata for saving
-            EnsureChannelFirst(),
-            Orientation(axcodes="RAS"),  # Align to RAS orientation
-            Spacing(pixdim=atlas_res, mode="bilinear"),  # Resample to target resolution
-            ScaleIntensityRangePercentiles(
+            LoadImaged(keys=["image"]),  # Keep metadata for saving
+            EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),  # Add channel dimension if not present
+            Orientationd(keys=["image"], axcodes="RAS"),  # Align to RAS orientation
+            Spacingd(keys=["image"], pixdim=atlas_res, mode="bilinear"),  # Resample to target resolution
+            ScaleIntensityRangePercentilesd(
+                keys=["image"],
                 lower=0, upper=100, b_min=0.0, b_max=1.0, clip=True
             ),  # Normalize to [0, 1]
         ]
@@ -85,7 +86,7 @@ def predict_single_volume(
 
     # Load and preprocess with MONAI
     print("  Loading and preprocessing with MONAI transforms...")
-    data = transforms(input_path)
+    data = transforms({"image": input_path})
 
     # Extract volume and metadata
     if isinstance(data, dict):

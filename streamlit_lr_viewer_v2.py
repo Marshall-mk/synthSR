@@ -1,8 +1,8 @@
 """
-Streamlit Interactive Viewer for Low-Resolution Creation Pipeline
+Streamlit Interactive Viewer for Frequency-Domain LR Creation Pipeline
 
-This app allows you to interactively tune all parameters of the LR creation pipeline
-and visualize the results in real-time with a 3D slice viewer.
+This app demonstrates the FFT-based k-space cropping approach for creating
+low-resolution MRI data, comparing it with the spatial-domain method.
 """
 
 import streamlit as st
@@ -21,20 +21,22 @@ except ImportError:
     NILEARN_AVAILABLE = False
 
 from monai.transforms import GaussianSmooth, ScaleIntensityRangePercentiles
+from src.data_fft import (
+    HRLRDataGenerator,
+    freq_domain_downsample_torch,
+    FrequencyDomainDownsample,
+)
 from src.domain_rand import (
-    MimicAcquisition,
-    blurring_sigma_for_downsampling,
     RandomSpatialDeformation,
     BiasFieldCorruption,
     IntensityAugmentation,
 )
 
-
 # Page config
-st.set_page_config(page_title="LR Pipeline Viewer", layout="wide")
+st.set_page_config(page_title="FFT LR Pipeline Viewer", layout="wide")
 
-st.title("🔬 Low-Resolution Creation Pipeline Viewer")
-st.markdown("Interactively tune all parameters and visualize the results")
+st.title("🔬 Frequency-Domain LR Creation Pipeline Viewer")
+st.markdown("Interactively tune parameters and visualize FFT-based downsampling")
 
 # Session state for caching
 if "hr_image" not in st.session_state:
@@ -45,11 +47,11 @@ if "image_path" not in st.session_state:
 
 @st.cache_data
 def load_image(image_path):
-    """Load NIfTI image and return as torch tensor (raw values, no normalization)"""
+    """Load NIfTI image and return as torch tensor"""
     nib_img = nib.load(str(image_path))
     img_data = nib_img.get_fdata()
 
-    # Convert to tensor without normalization (matches training pipeline)
+    # Convert to tensor
     img_tensor = torch.from_numpy(img_data).float()
     # Add batch and channel dimensions: (1, 1, D, H, W)
     img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)
@@ -57,15 +59,14 @@ def load_image(image_path):
     return img_tensor, nib_img.affine
 
 
-def apply_pipeline(hr_image, params):
+def apply_pipeline_v2(hr_image, params):
     """
-    Apply the LR creation pipeline with given parameters.
+    Apply the frequency-domain LR creation pipeline.
 
-    Mimics the HRLRDataGenerator pipeline but with interactive parameters.
-    Returns the normalized HR image, transformed LR image, and logs of min/max values at each step.
+    Returns both the transformed image and logs of min/max values at each step.
     """
     device = hr_image.device
-    hr_image = hr_image.clone()  # Clone HR to avoid modifying the original
+    hr_image = hr_image.clone()
     lr_image = hr_image.clone()
 
     # Initialize logging
@@ -102,7 +103,7 @@ def apply_pipeline(hr_image, params):
                 params["elastic_mag_min"],
                 params["elastic_mag_max"],
             ),
-            prob_deform=1.0,  # Always apply for visualization
+            prob_deform=1.0,
         )
         lr_image = deformer(lr_image, interpolation="bilinear")
         logs.append(
@@ -126,7 +127,7 @@ def apply_pipeline(hr_image, params):
         bias = BiasFieldCorruption(
             bias_field_std=params["bias_field_std"],
             bias_scale=params["bias_scale"],
-            prob=1.0,  # Always apply for visualization
+            prob=1.0,
         )
         lr_image = bias(lr_image)
         logs.append(
@@ -162,7 +163,7 @@ def apply_pipeline(hr_image, params):
             }
         )
 
-        # Apply fixed blur after intensity aug (as in pipeline)
+        # Apply fixed blur after intensity aug
         if params["apply_fixed_blur"]:
             fixed_blur = GaussianSmooth(sigma=params["fixed_blur_sigma"])
             # GaussianSmooth expects input without batch dimension (C, D, H, W)
@@ -183,11 +184,11 @@ def apply_pipeline(hr_image, params):
             }
         )
 
-    # 4. Normalize before resolution simulation (normalize both HR and LR)
+    # 4. Normalize before FFT downsampling
     normalizer = ScaleIntensityRangePercentiles(
         lower=0, upper=100, b_min=0.0, b_max=1.0, clip=True
     )
-    hr_image = normalizer(hr_image)  # Normalize HR image too
+    hr_image = normalizer(hr_image)  # Normalize HR too
     lr_image = normalizer(lr_image)
     logs.append(
         {
@@ -197,33 +198,28 @@ def apply_pipeline(hr_image, params):
         }
     )
 
-    # 5. Resolution Randomization (MimicAcquisition)
-    if params["apply_resolution_randomization"]:
-        # Use manual resolution values
+    # 5. Frequency-Domain Downsampling
+    if params["apply_freq_downsampling"]:
+        # Create resolution tensor
         resolution = torch.tensor(
             [[params["res_x"], params["res_y"], params["res_z"]]],
             dtype=torch.float32,
             device=device,
         )
-        thickness = torch.tensor(
-            [[params["thick_x"], params["thick_y"], params["thick_z"]]],
-            dtype=torch.float32,
-            device=device,
-        )
 
-        # Simulate acquisition (includes blur, downsample, noise, upsample)
-        mimic = MimicAcquisition(
+        # Create frequency-domain downsampler
+        freq_downsample = FrequencyDomainDownsample(
             volume_res=params["atlas_res"],
             target_res=params["target_res"],
             output_shape=list(hr_image.shape[2:]),
             noise_std=params["acquisition_noise_std"],
             prob_noise=1.0 if params["acquisition_noise_std"] > 0 else 0.0,
-            build_dist_map=False,
         )
-        lr_image = mimic(lr_image, resolution, thickness)
+
+        lr_image = freq_downsample(lr_image, resolution)
         logs.append(
             {
-                "step": "5. After Resolution Simulation",
+                "step": "5. After FFT Downsampling",
                 "min": lr_image.min().item(),
                 "max": lr_image.max().item(),
             }
@@ -231,15 +227,16 @@ def apply_pipeline(hr_image, params):
     else:
         logs.append(
             {
-                "step": "5. Resolution Simulation (skipped)",
+                "step": "5. FFT Downsampling (skipped)",
                 "min": lr_image.min().item(),
                 "max": lr_image.max().item(),
             }
         )
 
-    # Final clipping to [0, 1] (if enabled)
+    # Final clipping to [0, 1]
     if params["clip_to_unit_range"]:
-        lr_image = torch.clamp(lr_image, 0.0, 1.0)
+        # lr_image = torch.clamp(lr_image, 0.0, 1.0)
+        lr_image = normalizer(lr_image)
         logs.append(
             {
                 "step": "6. After Final Clipping [0,1]",
@@ -281,9 +278,22 @@ if st.session_state.hr_image is not None:
     hr_image = st.session_state.hr_image
     D, H, W = hr_image.shape[2:]
 
+    # Info box explaining the difference
+    st.info(
+        """
+    **🔬 Frequency-Domain Downsampling (FFT Method)**
+
+    This approach uses k-space (frequency domain) cropping to simulate MRI acquisition:
+    - More realistic simulation of MRI physics
+    - Downsamples along the most anisotropic axis
+    - Creates aliasing artifacts similar to real undersampled MRI
+    - Used in the original downsampling paper
+    """
+    )
+
     # Create tabs for parameter groups
     tab1, tab2, tab3, tab4 = st.tabs(
-        ["🔧 Deformation", "💡 Bias Field & Intensity", "🌊 Blur", "📐 Resolution"]
+        ["🔧 Deformation", "💡 Bias Field & Intensity", "🌊 Blur", "📐 FFT Downsampling"]
     )
 
     params = {}
@@ -297,80 +307,34 @@ if st.session_state.hr_image is not None:
 
             st.subheader("Affine Transformations")
             params["scaling_bounds"] = st.slider(
-                "Scaling Bounds",
-                0.0,
-                0.5,
-                0.15,
-                0.01,
-                help="Random scaling: [1-s, 1+s]. Set to 0 to disable.",
+                "Scaling Bounds", 0.0, 0.5, 0.15, 0.01
             )
-
             params["rotation_bounds"] = st.slider(
-                "Rotation Bounds (degrees)",
-                0.0,
-                45.0,
-                15.0,
-                1.0,
-                help="Random rotation around each axis. Set to 0 to disable.",
+                "Rotation Bounds (degrees)", 0.0, 45.0, 15.0, 1.0
             )
-
             params["shearing_bounds"] = st.slider(
-                "Shearing Bounds",
-                0.0,
-                0.1,
-                0.012,
-                0.001,
-                help="Random shearing deformation. Set to 0 to disable.",
+                "Shearing Bounds", 0.0, 0.1, 0.012, 0.001
             )
-
             params["translation_bounds"] = st.slider(
-                "Translation Bounds (voxels)",
-                0.0,
-                20.0,
-                10.0,
-                1.0,
-                help="Random translation in voxels. Set to 0 to disable.",
+                "Translation Bounds (voxels)", 0.0, 20.0, 10.0, 1.0
             )
-
             params["enable_90_rotations"] = st.checkbox(
-                "Enable 90° Rotations",
-                value=False,
-                help="Random 90/180/270 degree rotations for axis alignment",
+                "Enable 90° Rotations", value=False
             )
 
         with col2:
             st.subheader("Elastic Deformation")
             params["elastic_sigma_min"] = st.slider(
-                "Elastic Sigma Min",
-                0.0,
-                10.0,
-                5.0,
-                0.5,
-                help="Minimum smoothness of elastic deformation",
+                "Elastic Sigma Min", 0.0, 10.0, 5.0, 0.5
             )
             params["elastic_sigma_max"] = st.slider(
-                "Elastic Sigma Max",
-                0.0,
-                15.0,
-                7.0,
-                0.5,
-                help="Maximum smoothness of elastic deformation",
+                "Elastic Sigma Max", 0.0, 15.0, 7.0, 0.5
             )
             params["elastic_mag_min"] = st.slider(
-                "Elastic Magnitude Min",
-                0.0,
-                500.0,
-                100.0,
-                10.0,
-                help="Minimum strength of elastic deformation",
+                "Elastic Magnitude Min", 0.0, 500.0, 100.0, 10.0
             )
             params["elastic_mag_max"] = st.slider(
-                "Elastic Magnitude Max",
-                0.0,
-                500.0,
-                200.0,
-                10.0,
-                help="Maximum strength of elastic deformation",
+                "Elastic Magnitude Max", 0.0, 500.0, 200.0, 10.0
             )
 
     # Tab 2: Bias Field & Intensity
@@ -381,20 +345,10 @@ if st.session_state.hr_image is not None:
             st.subheader("Bias Field Corruption")
             params["apply_bias_field"] = st.checkbox("Enable Bias Field", value=False)
             params["bias_field_std"] = st.slider(
-                "Bias Field Strength",
-                0.0,
-                1.0,
-                0.3,
-                0.05,
-                help="Standard deviation of bias field coefficients",
+                "Bias Field Strength", 0.0, 1.0, 0.3, 0.05
             )
             params["bias_scale"] = st.slider(
-                "Bias Field Smoothness",
-                0.01,
-                0.1,
-                0.025,
-                0.005,
-                help="Lower = smoother (0.025 on 128³ creates 3³ bias field)",
+                "Bias Field Smoothness", 0.01, 0.1, 0.025, 0.005
             )
 
         with col2:
@@ -402,61 +356,40 @@ if st.session_state.hr_image is not None:
             params["apply_intensity_aug"] = st.checkbox(
                 "Enable Intensity Aug", value=False
             )
-            params["clip_value"] = st.slider(
-                "Intensity Clipping",
-                0,
-                500,
-                300,
-                10,
-                help="Clip intensities to [0, value]. Set to 0 to disable.",
-            )
-            params["gamma_std"] = st.slider(
-                "Gamma Correction Std",
-                0.0,
-                1.0,
-                0.5,
-                0.05,
-                help="Std of gamma parameter. I_out = I_in^(exp(γ))",
-            )
+            params["clip_value"] = st.slider("Intensity Clipping", 0, 500, 300, 10)
+            params["gamma_std"] = st.slider("Gamma Correction Std", 0.0, 1.0, 0.5, 0.05)
 
     # Tab 3: Blur
     with tab3:
         st.subheader("Fixed Gaussian Blur (MRI PSF Simulation)")
-        params["apply_fixed_blur"] = st.checkbox(
-            "Enable Fixed Blur",
-            value=True,
-            help="Applied after intensity augmentation, before resolution simulation",
-        )
-        params["fixed_blur_sigma"] = st.slider(
-            "Fixed Blur Sigma",
-            0.0,
-            2.0,
-            0.5,
-            0.1,
-            help="Simulates MRI point spread function",
-        )
+        params["apply_fixed_blur"] = st.checkbox("Enable Fixed Blur", value=True)
+        params["fixed_blur_sigma"] = st.slider("Fixed Blur Sigma", 0.0, 2.0, 0.5, 0.1)
 
-        st.info(
-            "💡 This blur is separate from the anti-aliasing blur in resolution simulation"
-        )
-
-    # Tab 4: Resolution Randomization
+    # Tab 4: FFT Downsampling
     with tab4:
         col_top1, col_top2 = st.columns(2)
 
         with col_top1:
-            params["apply_resolution_randomization"] = st.checkbox(
-                "Enable Resolution Randomization", value=True
+            params["apply_freq_downsampling"] = st.checkbox(
+                "Enable FFT Downsampling", value=True
             )
 
         with col_top2:
             params["clip_to_unit_range"] = st.checkbox(
-                "Clip to [0,1] Range",
-                value=True,
-                help="Final clipping for training stability (matches training pipeline)",
+                "Clip to [0,1] Range", value=True
             )
 
         st.markdown("---")
+
+        st.info(
+            """
+        **How FFT Downsampling Works:**
+        1. Transforms image to frequency domain (k-space)
+        2. Crops high frequencies (simulates undersampling)
+        3. Transforms back to spatial domain
+        4. Automatically selects the most anisotropic axis
+        """
+        )
 
         col1, col2, col3 = st.columns(3)
 
@@ -470,62 +403,45 @@ if st.session_state.hr_image is not None:
             params["res_z"] = st.slider("Z Resolution", 1.0, 9.0, 4.0, 0.1)
 
         with col2:
-            st.subheader("Slice Thickness (mm)")
-            params["thick_x"] = st.slider("X Thickness", 1.0, 9.0, 1.0, 0.1)
-            params["thick_y"] = st.slider("Y Thickness", 1.0, 9.0, 1.0, 0.1)
-            params["thick_z"] = st.slider("Z Thickness", 1.0, 9.0, 5.0, 0.1)
-
-            st.info("💡 Thickness can be ≥ resolution to simulate MRI physics")
-
-        with col3:
             st.subheader("Acquisition Noise")
             params["acquisition_noise_std"] = st.slider(
-                "Noise Std",
-                0.0,
-                0.1,
-                0.01,
-                0.001,
-                help="Gaussian noise added during acquisition simulation",
+                "Noise Std", 0.0, 0.1, 0.01, 0.001
             )
 
+            # Calculate which axis will be downsampled
+            factors = np.array([params["res_x"], params["res_y"], params["res_z"]])
+            downsample_axis = np.argmax(factors)
+            axis_names = ["X (Sagittal)", "Y (Coronal)", "Z (Axial)"]
+
             st.markdown("---")
-            st.subheader("Info")
+            st.subheader("Downsampling Info")
+            st.metric("Selected Axis", axis_names[downsample_axis])
+            st.metric("Downsampling Factor", f"{factors[downsample_axis]:.1f}x")
+
+        with col3:
+            st.subheader("Geometry")
             is_isotropic = params["res_x"] == params["res_y"] == params["res_z"]
-            st.metric("Geometry", "Isotropic" if is_isotropic else "Anisotropic")
+            st.metric("Type", "Isotropic" if is_isotropic else "Anisotropic")
 
             avg_res = (params["res_x"] + params["res_y"] + params["res_z"]) / 3
             quality = "High" if avg_res < 2.0 else "Medium" if avg_res < 4.0 else "Low"
             st.metric("Quality", quality)
-
-            # Compute blur sigma for anti-aliasing
-            if params["apply_resolution_randomization"]:
-                sigma = blurring_sigma_for_downsampling(
-                    torch.tensor([1.0, 1.0, 1.0]),
-                    torch.tensor([params["res_x"], params["res_y"], params["res_z"]]),
-                    torch.tensor(
-                        [params["thick_x"], params["thick_y"], params["thick_z"]]
-                    ),
-                )
-                st.metric("Anti-alias Blur σ (max)", f"{sigma.max().item():.2f}")
 
     # Generate LR image
     st.markdown("---")
 
     generate_col1, generate_col2 = st.columns([3, 1])
     with generate_col1:
-        st.subheader("🎯 Generated Low-Resolution Image")
+        st.subheader("🎯 Generated Low-Resolution Image (FFT Method)")
     with generate_col2:
         if st.button("🔄 Regenerate", use_container_width=True):
             st.rerun()
 
-    with st.spinner("Generating LR image..."):
-        hr_image, lr_image, intensity_logs = apply_pipeline(hr_image, params)
+    with st.spinner("Generating LR image with FFT downsampling..."):
+        hr_image_norm, lr_image, intensity_logs = apply_pipeline_v2(hr_image, params)
 
     # Display intensity range logs
     st.markdown("### 📊 Intensity Range at Each Pipeline Step")
-    st.markdown("Track how min/max values change through the pipeline:")
-
-    # Create a nicely formatted table
     log_data = []
     for log in intensity_logs:
         log_data.append(
@@ -572,7 +488,7 @@ if st.session_state.hr_image is not None:
         )
 
     # Extract slices
-    hr_np = hr_image.squeeze().cpu().numpy()
+    hr_np = hr_image_norm.squeeze().cpu().numpy()
     lr_np = lr_image.squeeze().cpu().numpy()
 
     # Display with nilearn or matplotlib fallback
@@ -582,7 +498,7 @@ if st.session_state.hr_image is not None:
         # Create temporary NIfTI files for nilearn
         with tempfile.TemporaryDirectory() as tmpdir:
             hr_path = os.path.join(tmpdir, "hr.nii.gz")
-            lr_path = os.path.join(tmpdir, "lr.nii.gz")
+            lr_path = os.path.join(tmpdir, "lr_fft.nii.gz")
             diff_path = os.path.join(tmpdir, "diff.nii.gz")
 
             # Save as NIfTI
@@ -608,7 +524,7 @@ if st.session_state.hr_image is not None:
                 plt.close()
 
             with col2:
-                st.markdown("#### Generated LR - Orthogonal Views")
+                st.markdown("#### Generated LR (FFT) - Orthogonal Views")
                 fig2 = plt.figure(figsize=(12, 4))
                 display = plotting.plot_anat(
                     lr_path,
@@ -617,7 +533,7 @@ if st.session_state.hr_image is not None:
                     figure=fig2,
                     annotate=True,
                     draw_cross=True,
-                    title="Generated LR"
+                    title="Generated LR (FFT)"
                 )
                 st.pyplot(fig2)
                 plt.close()
@@ -668,7 +584,7 @@ if st.session_state.hr_image is not None:
             plt.close()
 
         with col2:
-            st.markdown("#### Generated LR")
+            st.markdown("#### Generated LR (FFT)")
             fig2, ax2 = plt.subplots(figsize=(6, 6))
             im2 = ax2.imshow(lr_slice.T, cmap=colormap, origin="lower")
             ax2.axis("off")
@@ -711,14 +627,14 @@ if st.session_state.hr_image is not None:
         rmse = np.sqrt(mse)
         st.metric("RMSE", f"{rmse:.4f}")
 
-        # R² (coefficient of determination)
+        # R²
         ss_res = np.sum((hr_np - lr_np) ** 2)
         ss_tot = np.sum((hr_np - hr_np.mean()) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
         st.metric("R²", f"{r2:.4f}")
 
     with stat_col5:
-        # PSNR (assume max value is 1.0 since normalized)
+        # PSNR
         if mse > 0:
             psnr = 10 * np.log10(1.0 / mse)
             st.metric("PSNR (dB)", f"{psnr:.2f}")
@@ -726,14 +642,14 @@ if st.session_state.hr_image is not None:
             st.metric("PSNR (dB)", "∞")
 
     # Display acquisition parameters used
-    if params["apply_resolution_randomization"]:
+    if params["apply_freq_downsampling"]:
         st.markdown("---")
-        st.subheader("🎯 Acquisition Parameters Used")
+        st.subheader("🎯 FFT Downsampling Parameters Used")
 
         acq_col1, acq_col2 = st.columns(2)
 
         with acq_col1:
-            st.markdown("**Resolution (mm)**")
+            st.markdown("**Target Resolution (mm)**")
             st.code(
                 f"X: {params['res_x']:.2f} mm\n"
                 f"Y: {params['res_y']:.2f} mm\n"
@@ -741,12 +657,8 @@ if st.session_state.hr_image is not None:
             )
 
         with acq_col2:
-            st.markdown("**Slice Thickness (mm)**")
-            st.code(
-                f"X: {params['thick_x']:.2f} mm\n"
-                f"Y: {params['thick_y']:.2f} mm\n"
-                f"Z: {params['thick_z']:.2f} mm"
-            )
+            st.markdown("**Downsampling Method**")
+            st.code("FFT k-space cropping\nAutomatic axis selection")
 
     # Save option
     st.markdown("---")
@@ -754,7 +666,7 @@ if st.session_state.hr_image is not None:
 
     with save_col1:
         save_path = st.text_input(
-            "Save LR Image Path", value="lr_output.nii.gz", placeholder="output.nii.gz"
+            "Save LR Image Path", value="lr_output_fft.nii.gz", placeholder="output.nii.gz"
         )
 
     with save_col2:
@@ -770,117 +682,74 @@ else:
     # Landing page
     st.info("👈 Please load a NIfTI image from the sidebar to begin")
 
-    st.markdown("""
+    st.markdown(
+        """
     ### 🎯 What is this tool?
 
-    This interactive viewer allows you to:
-    - Load 3D MRI volumes (NIfTI format)
-    - Tune all parameters of the **MONAI-based** low-resolution creation pipeline
-    - Visualize the results in real-time
-    - Navigate through slices in different planes
-    - Compare original and degraded images side-by-side
-    - Save generated LR images
+    This interactive viewer demonstrates **frequency-domain (FFT) downsampling** for creating
+    low-resolution MRI data - an alternative to spatial-domain methods.
+
+    ### 🔬 Why FFT Downsampling?
+
+    **Frequency-domain downsampling**:
+    - ✅ Simulates actual MRI k-space undersampling
+    - ✅ Creates realistic aliasing artifacts
+    - ✅ Better matches MRI acquisition physics
+    - ✅ Used in the original downsampling paper
+
+    **Spatial-domain downsampling** (traditional):
+    - Uses interpolation (trilinear, etc.)
+    - Smoother but less realistic
+    - Doesn't match MRI physics as closely
 
     ### 📋 Pipeline Components
 
-    The low-resolution creation pipeline includes:
-
-    1. **Spatial Deformation** (MONAI RandAffine + Rand3DElastic)
-       - Affine: rotation, scaling, shearing, translation
-       - Elastic: smooth non-linear deformations
-       - Optional 90° rotations for axis alignment
-
-    2. **Bias Field Corruption**
-       - Smooth multiplicative intensity inhomogeneity
-       - Simulates MRI B1 field artifacts
-
-    3. **Intensity Augmentation**
-       - Outlier clipping to stabilize training
-       - Gamma correction: I_out = I_in^(exp(γ))
-       - Power-law intensity transformations
-
-    4. **Fixed Gaussian Blur**
-       - Simulates MRI point spread function
-       - Applied after intensity augmentation
-
-    5. **Resolution Randomization** (MimicAcquisition)
-       - Anti-aliasing blur (prevents aliasing artifacts)
-       - Downsampling to simulate acquisition
-       - Gaussian noise injection
-       - Upsampling back to target shape
-       - Simulates realistic MRI acquisition physics
+    1. **Spatial Deformation** - Optional anatomical variations
+    2. **Bias Field Corruption** - MRI B1 field inhomogeneity
+    3. **Intensity Augmentation** - Contrast variations
+    4. **Fixed Gaussian Blur** - MRI point spread function
+    5. **FFT Downsampling** - K-space cropping along most anisotropic axis
+    6. **Noise Injection** - Scanner noise simulation
 
     ### 🚀 Getting Started
 
-    1. Enter the path to a NIfTI file in the sidebar
+    1. Enter path to a NIfTI file in the sidebar
     2. Click "Load Image"
-    3. Navigate through the tabs to adjust parameters
-    4. View the results in real-time
-    5. Use the Regenerate button to apply random variations
-    6. Save the generated LR image if needed
+    3. Navigate through tabs to adjust parameters
+    4. Enable FFT downsampling in the "FFT Downsampling" tab
+    5. View results in real-time
+    6. Compare with spatial-domain method using the original viewer
 
-    ### 💡 Tips
+    ### 💡 Key Differences from Spatial Method
 
-    - **Start simple**: Enable only resolution randomization first
-    - **Anisotropic resolutions** (e.g., 1×1×4mm) simulate clinical thick-slice scans
-    - **Slice thickness** can be > resolution to model MRI slice profile
-    - **Combine augmentations** gradually to see cumulative effects
-    - **Use difference view** to understand what information is lost
-    - **Check statistics** to ensure reasonable degradation levels
+    | Feature | Spatial Method | FFT Method |
+    |---------|----------------|------------|
+    | Domain | Spatial | Frequency (k-space) |
+    | Operation | Interpolation | FFT + crop + iFFT |
+    | Artifacts | Blurring | Aliasing |
+    | MRI Physics | Approximation | More realistic |
+    | Axis | Multi-axis | Single (most anisotropic) |
 
-    ### 📊 Understanding the Pipeline Order
+    ### 📊 Recommended Settings
 
-    ```
-    HR Image (normalized to [0,1])
-         ↓
-    1. Spatial Deformation (if enabled)
-         ↓
-    2. Bias Field Corruption (if enabled)
-         ↓
-    3. Intensity Augmentation (if enabled)
-         ↓
-    4. Fixed Blur (if enabled)
-         ↓
-    5. Normalize to [0,1]
-         ↓
-    6. Resolution Simulation:
-       • Anti-alias blur
-       • Downsample
-       • Add noise
-       • Upsample to original shape
-         ↓
-    7. Final clip to [0,1]
-         ↓
-    LR Image
-    ```
-
-    ### 🔬 Parameter Recommendations
-
-    **Light Degradation** (testing):
-    - Resolution: 1×1×3mm
-    - Noise: 0.005
-    - Disable other augmentations
-
-    **Moderate Degradation** (typical training):
-    - Resolution: 1×1×4-5mm
-    - Bias field: 0.3 std, 0.025 scale
-    - Gamma: 0.5 std
+    **Typical Clinical Anisotropy** (4x in Z):
+    - Resolution: 1×1×4 mm
     - Noise: 0.01
+    - Disable other augmentations for testing
 
-    **Heavy Degradation** (challenging):
-    - Resolution: 1×1×6-9mm (very anisotropic)
-    - Enable deformation: 15° rotation, 0.15 scaling
-    - Bias field: 0.5 std
-    - Gamma: 0.7 std
+    **Heavy Anisotropy** (challenging):
+    - Resolution: 1×1×6-9 mm
+    - Enable bias field: 0.3 std
+    - Enable gamma: 0.5 std
     - Noise: 0.02
-    """)
+    """
+    )
 
 # Footer
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: gray;'>"
-    "SynthSR with MONAI - Interactive LR Pipeline Viewer | "
-    "Updated for MONAI-based transforms"
+    "SynthSR with FFT Downsampling - Frequency-Domain LR Pipeline Viewer"
     "</div>",
     unsafe_allow_html=True,
 )

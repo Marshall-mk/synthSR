@@ -745,8 +745,8 @@ def sliding_window_inference(
     volume = volume.to(device)
 
     # Print info
-    print(f"Sliding window inference on volume shape: {volume.shape}")
-    print(f"Patch size: {patch_size}, Overlap: {overlap:.1%}, Batch size: {batch_size}")
+    # print(f"Sliding window inference on volume shape: {volume.shape}")
+    # print(f"Patch size: {patch_size}, Overlap: {overlap:.1%}, Batch size: {batch_size}")
 
     # Use MONAI's sliding window inference
     with torch.no_grad():

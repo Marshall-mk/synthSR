@@ -24,7 +24,7 @@ from src.utils import (
     calculate_metrics,
     sliding_window_inference,
 )
-from src.data import HRLRDataGenerator, create_dataset
+from src.data_fft import HRLRDataGenerator, create_dataset
 
 
 def train_regression_model(
