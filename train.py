@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 from datetime import datetime
 from tqdm import tqdm
 from typing import List
+import wandb
 
 # MONAI imports
 from monai.data import DataLoader
@@ -53,6 +54,10 @@ def train_regression_model(
     use_sliding_window_val: bool = False,
     sw_overlap: float = 0.5,
     sw_batch_size: int = 4,
+    use_wandb: bool = False,
+    wandb_project: str = "synthsr",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
 ):
     """
     Stage 1: Train regression UNet
@@ -83,6 +88,10 @@ def train_regression_model(
             to get accurate full-volume metrics. Slower but more representative.
         sw_overlap: Overlap for sliding window validation (default: 0.5)
         sw_batch_size: Batch size for sliding window patches (default: 4)
+        use_wandb: Whether to use Weights & Biases for tracking
+        wandb_project: W&B project name (default: "synthsr")
+        wandb_entity: W&B entity/team name (optional)
+        wandb_run_name: W&B run name (optional, auto-generated if None)
     """
     print("=" * 80)
     print("STAGE 1: Training Regression UNet")
@@ -234,6 +243,45 @@ def train_regression_model(
     print(f"Training for {epochs} epochs, batch size {batch_size}")
     print(f"Initial learning rate: {learning_rate}")
     print(f"Device: {device}")
+
+    # Initialize Weights & Biases if enabled
+    if use_wandb:
+        wandb_config = {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "loss_function": loss_name,
+            "output_shape": output_shape,
+            "atlas_res": atlas_res,
+            "min_resolution": min_resolution,
+            "max_res_aniso": max_res_aniso,
+            "randomise_res": randomise_res,
+            "apply_lr_deformation": apply_lr_deformation,
+            "apply_bias_field": apply_bias_field,
+            "apply_intensity_aug": apply_intensity_aug,
+            "enable_90_rotations": enable_90_rotations,
+            "clip_to_unit_range": clip_to_unit_range,
+            "num_workers": num_workers,
+            "use_cache": use_cache,
+            "use_sliding_window_val": use_sliding_window_val,
+            "sw_overlap": sw_overlap,
+            "sw_batch_size": sw_batch_size,
+            "model_parameters": sum(p.numel() for p in model.parameters()),
+            "n_train_samples": len(hr_image_paths),
+            "n_val_samples": len(val_image_paths) if val_image_paths else 0,
+        }
+
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wandb_config,
+            resume="allow" if checkpoint else False,
+        )
+
+        # Watch model gradients and parameters
+        wandb.watch(model, criterion, log="all", log_freq=100)
+        print(f"Weights & Biases initialized: {wandb.run.name}")
 
     # Setup CSV logging with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -452,10 +500,34 @@ def train_regression_model(
         csv_writer.writerow(log_data)
         csv_file.flush()  # Ensure data is written immediately
 
+        # Log to Weights & Biases
+        if use_wandb:
+            wandb_log_data = {
+                "epoch": epoch + 1,
+                "train/loss": avg_loss,
+                "train/learning_rate": optimizer.param_groups[0]['lr'],
+                "timing/epoch_time": epoch_time,
+                "timing/data_loading_time": data_loading_time,
+                "timing/forward_backward_time": forward_backward_time,
+            }
+
+            if val_dataloader and val_loss is not None and val_metrics is not None:
+                wandb_log_data.update({
+                    "val/loss": val_loss,
+                    "val/mae": val_metrics['mae'],
+                    "val/mse": val_metrics['mse'],
+                    "val/rmse": val_metrics['rmse'],
+                    "val/psnr": val_metrics['psnr'],
+                    "val/r2": val_metrics['r2'],
+                    "timing/validation_time": validation_time,
+                })
+
+            wandb.log(wandb_log_data)
+
         # Save checkpoint at specified intervals
         if (epoch + 1) % save_interval == 0:
             checkpoint_path = os.path.join(
-                model_dir, f"regression_unet_epoch_{epoch + 1:03d}.pth"
+                model_dir, f"regression_unet_epoch_{epoch + 1:04d}.pth"
             )
             model_config = {
                 "nb_features": 24,
@@ -506,6 +578,19 @@ def train_regression_model(
         scheduler_state_dict=scheduler.state_dict(),
     )
     print(f"Training complete! Final model saved to: {final_path}")
+
+    # Finish Weights & Biases run
+    if use_wandb:
+        # Save final model as artifact
+        artifact = wandb.Artifact(
+            name=f"model-{wandb.run.id}",
+            type="model",
+            description="Final trained SynthSR UNet3D model",
+        )
+        artifact.add_file(final_path)
+        wandb.log_artifact(artifact)
+        wandb.finish()
+        print("Weights & Biases run finished and model artifact saved")
 
 
 if __name__ == "__main__":
@@ -653,6 +738,31 @@ if __name__ == "__main__":
         help="Optional validation images directory",
     )
 
+    # Weights & Biases arguments
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Enable Weights & Biases tracking",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="synthsr",
+        help="W&B project name (default: synthsr)",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity/team name (optional)",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name (optional, auto-generated if not provided)",
+    )
+
     args = parser.parse_args()
 
     # Check device availability
@@ -719,4 +829,8 @@ if __name__ == "__main__":
         use_sliding_window_val=args.use_sliding_window_val,
         sw_overlap=args.sw_overlap,
         sw_batch_size=args.sw_batch_size,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
     )
