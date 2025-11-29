@@ -97,11 +97,12 @@ def load_image_paths_from_csv(
     base_dir: Union[str, Path],
     split: str = "train",
     acquisition_types: Optional[List[str]] = None,
+    mri_classifications: Optional[List[str]] = None,
     filter_4d: bool = True,
     log_filtered_path: Optional[Union[str, Path]] = None,
 ) -> List[Path]:
     """
-    Load image paths from a CSV file with filtering by split and acquisition type.
+    Load image paths from a CSV file with filtering by split, acquisition type, and MRI classification.
 
     Args:
         csv_path: Path to CSV file
@@ -109,6 +110,8 @@ def load_image_paths_from_csv(
         split: Data split to filter for ('train', 'val', or 'test')
         acquisition_types: List of acquisition types to include (default: ['3D'] only)
                           Set to None to include all types
+        mri_classifications: List of MRI classifications to include (e.g., ['T1', 'T2', 'FLAIR'])
+                            Set to None to include all classifications
         filter_4d: If True, filters out 4D images (with time dimension) using 'dimensions' column
         log_filtered_path: Optional path to save list of filtered 4D images (CSV format)
 
@@ -120,14 +123,15 @@ def load_image_paths_from_csv(
         - relative_path: Relative path to the image file
         - mr_acquisition_type: Type of MR acquisition ('3D' or '2D')
         - split: Data split ('train', 'val', or 'test')
+        - MRI_classification (optional): MRI classification type ('T1', 'T2', 'FLAIR', etc.)
         - dimensions (optional): Image dimensions as tuple string, e.g., "(256, 256, 128)"
 
     Example CSV:
-        relative_path,mr_acquisition_type,split,dimensions
-        images/scan001.nii.gz,3D,train,"(256, 256, 128)"
-        images/scan002.nii.gz,2D,train,"(256, 256, 128)"
-        images/scan003.nii.gz,3D,val,"(256, 256, 128, 10)"
-        images/scan004.nii.gz,3D,test,"(256, 256, 128)"
+        relative_path,mr_acquisition_type,split,MRI_classification,dimensions
+        images/scan001.nii.gz,3D,train,T1,"(256, 256, 128)"
+        images/scan002.nii.gz,2D,train,T2,"(256, 256, 128)"
+        images/scan003.nii.gz,3D,val,FLAIR,"(256, 256, 128, 10)"
+        images/scan004.nii.gz,3D,test,T1,"(256, 256, 128)"
 
     Example:
         >>> # Load 3D training images only (filtering out 4D) with logging
@@ -137,6 +141,14 @@ def load_image_paths_from_csv(
         ...     split='train',
         ...     filter_4d=True,
         ...     log_filtered_path='./model/filtered_4d_train.csv'
+        ... )
+        >>>
+        >>> # Load T1 and T2 training images only
+        >>> train_paths = load_image_paths_from_csv(
+        ...     'data.csv',
+        ...     base_dir='/data/mri',
+        ...     split='train',
+        ...     mri_classifications=['T1', 'T2']
         ... )
         >>>
         >>> # Load validation images of all types (including 4D)
@@ -190,6 +202,25 @@ def load_image_paths_from_csv(
         raise ValueError(
             f"No images found for split '{split}' with acquisition types {acquisition_types}. "
             f"Available acquisition types: {df[df['split'] == split]['mr_acquisition_type'].unique().tolist()}"
+        )
+
+    # Filter by MRI classification if specified
+    if mri_classifications is not None and "MRI_classification" in df_filtered.columns:
+        df_filtered = df_filtered[
+            df_filtered["MRI_classification"].isin(mri_classifications)
+        ]
+
+        if len(df_filtered) == 0:
+            raise ValueError(
+                f"No images found for split '{split}' with MRI classifications {mri_classifications}. "
+                f"Available MRI classifications: {df[df['split'] == split]['MRI_classification'].unique().tolist()}"
+            )
+
+        print(f"Filtered by MRI classifications: {mri_classifications}")
+    elif mri_classifications is not None and "MRI_classification" not in df_filtered.columns:
+        print(
+            "Warning: 'MRI_classification' column not found in CSV. "
+            "Cannot filter by MRI classification. Continuing with all MRI types."
         )
 
     # Filter out 4D images if requested
@@ -264,15 +295,23 @@ def load_image_paths_from_csv(
             f"Check that files exist in {base_dir}"
         )
 
-    print(
-        f"Loaded {len(image_paths)} {split} images (acquisition types: {acquisition_types})"
-    )
+    # Build summary message
+    summary = f"Loaded {len(image_paths)} {split} images (acquisition types: {acquisition_types}"
+    if mri_classifications is not None:
+        summary += f", MRI classifications: {mri_classifications}"
+    summary += ")"
+    print(summary)
 
     return image_paths
 
 
 def get_image_paths(
-    image_dir=None, csv_file=None, base_dir=None, split="train", model_dir=None
+    image_dir=None,
+    csv_file=None,
+    base_dir=None,
+    split="train",
+    model_dir=None,
+    mri_classifications=None,
 ):
     """
     Get image paths from either directory or CSV file.
@@ -283,6 +322,8 @@ def get_image_paths(
         base_dir: Base directory for relative paths in CSV (required if csv_file is provided)
         split: Data split for CSV ('train', 'val', or 'test')
         model_dir: Model directory for saving filtered images log (optional)
+        mri_classifications: List of MRI classifications to include (e.g., ['T1', 'T2', 'FLAIR'])
+                           Only applicable when using csv_file
 
     Returns:
         List of image paths
@@ -302,6 +343,7 @@ def get_image_paths(
             csv_file,
             base_dir,
             split=split,
+            mri_classifications=mri_classifications,
             filter_4d=True,  # Filter out 4D images by default
             log_filtered_path=log_filtered_path,
         )

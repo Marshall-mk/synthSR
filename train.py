@@ -619,6 +619,13 @@ if __name__ == "__main__":
         help="Base directory for relative paths in CSV",
     )
     parser.add_argument(
+        "--mri_classes",
+        type=str,
+        nargs="+",
+        default=None,
+        help="MRI classification types to include (e.g., T1 T2 FLAIR). If not specified, all types are included.",
+    )
+    parser.add_argument(
         "--model_dir", type=str, required=True, help="Directory to save trained models"
     )
 
@@ -777,6 +784,7 @@ if __name__ == "__main__":
         base_dir=args.base_dir,
         split="train",
         model_dir=args.model_dir,
+        mri_classifications=args.mri_classes,
     )
 
     # Get validation image paths if needed
@@ -788,6 +796,7 @@ if __name__ == "__main__":
             base_dir=args.base_dir,
             split="val",
             model_dir=args.model_dir,
+            mri_classifications=args.mri_classes,
         )
 
     # Create model directory

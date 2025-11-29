@@ -5,6 +5,7 @@ nibabel
 tqdm
 accelerate
 monai
+wandb
 # Optional dependencies for visualization
 scipy
 matplotlib
