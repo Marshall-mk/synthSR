@@ -382,7 +382,7 @@ class HRLRDataGenerator:
             )
             thickness = resolution.clone()
 
-        lr_images = self._normalize_image(lr_images)
+        # lr_images = self._normalize_image(lr_images)
 
         # Final clipping to ensure [0, 1] range
         if self.clip_to_unit_range:

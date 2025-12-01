@@ -18,27 +18,26 @@ from transformers import get_cosine_schedule_with_warmup
 from monai.data import DataLoader
 
 # Import our modules
-from src.model import UNet3D 
-from src.models import create_model, list_available_models  
+from src.diff_models import DiffusionSuperResolution, create_diffusion_model
 from src.utils import (
     save_model_checkpoint,
     get_image_paths,
     save_training_config,
     find_latest_checkpoint,
-    get_loss_function,
     calculate_metrics,
-    sliding_window_inference,
 )
 from src.data_fft import HRLRDataGenerator, create_dataset
 
 
-def train_regression_model(
+def train_diffusion_model(
     hr_image_paths: List[str],
     model_dir: str,
     epochs: int = 100,
     batch_size: int = 1,
     learning_rate: float = 1e-4,
-    loss_name: str = "l1",
+    scheduler_type: str = "ddpm",
+    num_train_timesteps: int = 1000,
+    beta_schedule: str = "linear",
     output_shape: tuple = (128, 128, 128),
     checkpoint: str = None,
     device: str = "cuda",
@@ -55,18 +54,17 @@ def train_regression_model(
     clip_to_unit_range: bool = True,
     num_workers: int = None,
     use_cache: bool = False,
-    use_sliding_window_val: bool = False,
-    sw_overlap: float = 0.5,
-    sw_batch_size: int = 4,
+    num_inference_steps: int = 50,
     use_wandb: bool = False,
-    wandb_project: str = "synthsr",
+    wandb_project: str = "synthsr-diffusion",
     wandb_entity: str = None,
     wandb_run_name: str = None,
-    model_architecture: str = "unet3d",
-    model_name: str = None,
+    model_channels: int = 64,
+    use_resolution_conditioning: bool = True,
+    model_size: str = "base",
 ):
     """
-    Stage 1: Train regression UNet
+    Train diffusion-based super-resolution model.
 
     Args:
         hr_image_paths: List of paths to high-resolution images
@@ -74,6 +72,9 @@ def train_regression_model(
         epochs: Number of training epochs
         batch_size: Batch size
         learning_rate: Learning rate
+        scheduler_type: Type of noise scheduler ('ddpm' or 'ddim')
+        num_train_timesteps: Number of diffusion timesteps
+        beta_schedule: Beta schedule type ('linear', 'scaled_linear', 'squaredcos_cap_v2')
         output_shape: Output volume shape
         checkpoint: Optional checkpoint to resume from
         device: 'cuda' or 'cpu'
@@ -90,17 +91,17 @@ def train_regression_model(
         clip_to_unit_range: Whether to clip images to [0, 1] range
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
-        use_sliding_window_val: If True, use sliding window inference for validation
-            to get accurate full-volume metrics. Slower but more representative.
-        sw_overlap: Overlap for sliding window validation (default: 0.5)
-        sw_batch_size: Batch size for sliding window patches (default: 4)
+        num_inference_steps: Number of inference steps for validation sampling
         use_wandb: Whether to use Weights & Biases for tracking
-        wandb_project: W&B project name (default: "synthsr")
-        wandb_entity: W&B entity/team name (optional)
-        wandb_run_name: W&B run name (optional, auto-generated if None)
+        wandb_project: W&B project name
+        wandb_entity: W&B entity/team name
+        wandb_run_name: W&B run name
+        model_channels: Base number of channels in UNet (only for custom model)
+        use_resolution_conditioning: Whether to use resolution as conditioning
+        model_size: Model size preset for HF model ('tiny', 'small', 'base', 'large')
     """
     print("=" * 80)
-    print("STAGE 1: Training Regression UNet")
+    print("Training Diffusion-based Super-Resolution Model")
     print("=" * 80)
 
     # Create model directory
@@ -142,7 +143,7 @@ def train_regression_model(
         apply_bias_field=apply_bias_field,
         apply_intensity_aug=apply_intensity_aug,
         enable_90_rotations=enable_90_rotations,
-        clip_to_unit_range=clip_to_unit_range,  # Ensure [0, 1] range
+        clip_to_unit_range=clip_to_unit_range,
     )
 
     # Create dataset
@@ -152,7 +153,7 @@ def train_regression_model(
         target_shape=list(output_shape),
         target_spacing=atlas_res,
         use_cache=use_cache,
-        return_resolution=True,  # Return resolution for logging
+        return_resolution=True,
         is_training=True,
     )
 
@@ -177,7 +178,7 @@ def train_regression_model(
             target_shape=list(output_shape),
             target_spacing=atlas_res,
             use_cache=use_cache,
-            return_resolution=True, 
+            return_resolution=True,
             is_training=False,
         )
 
@@ -191,45 +192,23 @@ def train_regression_model(
         )
         print(f"Validation dataset: {len(val_dataset)} images")
 
-    # Create model based on architecture choice
-    print(f"Model architecture: {model_architecture}")
+    # Create diffusion model
+    print(f"Scheduler type: {scheduler_type}, Timesteps: {num_train_timesteps}")
+    print(f"Resolution conditioning: {use_resolution_conditioning}")
 
-    if model_architecture == "unet3d":
-        # Use original UNet3D from src.model
-        print("Creating original UNet3D model")
-        model = UNet3D(
-            nb_features=24,
-            input_shape=(1, *output_shape),
-            nb_levels=5,
-            conv_size=3,
-            nb_labels=1,
-            feat_mult=2,
-            final_pred_activation="linear",
-            nb_conv_per_level=2,
-        )
-    elif model_architecture == "monai":
-        # Use MONAI models from src.models
-        if model_name is None:
-            model_name = "segresnet_base"  # Default to SegResNet
-
-        print(f"Creating MONAI model: {model_name}")
-        model = create_model(
-            model_name=model_name,
-            img_size=output_shape,
-            in_channels=1,
-            out_channels=1,
-            device=None,  # We'll move to device after
-        )
-    else:
-        raise ValueError(
-            f"Unknown model_architecture: {model_architecture}. "
-            f"Choose 'unet3d' (original) or 'monai' (MONAI models)"
-        )
-
+    # UNet3DConditionModel
+    print(f"Creating UNet3DConditionModel (size: {model_size})")
+    model = create_diffusion_model(
+        image_size=output_shape,
+        in_channels=1,
+        model_size=model_size,
+        scheduler_type=scheduler_type,
+        num_train_timesteps=num_train_timesteps,
+        beta_schedule=beta_schedule,
+    )
+    
     # Move model to device
     model = model.to(device)
-
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Auto-detect and load checkpoint
     start_epoch = 0
@@ -251,10 +230,9 @@ def train_regression_model(
     else:
         print("No checkpoint found. Starting training from scratch.")
 
-    # Optimizer and loss
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = get_loss_function(loss_name)
-    print(f"Using loss function: {loss_name}")
+    # Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    print(f"Using AdamW optimizer")
 
     # Calculate total training steps for scheduler
     num_steps = len(dataloader) * epochs
@@ -288,7 +266,9 @@ def train_regression_model(
             "epochs": epochs,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
-            "loss_function": loss_name,
+            "scheduler_type": scheduler_type,
+            "num_train_timesteps": num_train_timesteps,
+            "beta_schedule": beta_schedule,
             "output_shape": output_shape,
             "atlas_res": atlas_res,
             "min_resolution": min_resolution,
@@ -301,9 +281,7 @@ def train_regression_model(
             "clip_to_unit_range": clip_to_unit_range,
             "num_workers": num_workers,
             "use_cache": use_cache,
-            "use_sliding_window_val": use_sliding_window_val,
-            "sw_overlap": sw_overlap,
-            "sw_batch_size": sw_batch_size,
+            "model_channels": model_channels,
             "model_parameters": sum(p.numel() for p in model.parameters()),
             "n_train_samples": len(hr_image_paths),
             "n_val_samples": len(val_image_paths) if val_image_paths else 0,
@@ -318,22 +296,39 @@ def train_regression_model(
         )
 
         # Watch model gradients and parameters
-        wandb.watch(model, criterion, log="all", log_freq=100)
+        wandb.watch(model, log="all", log_freq=100)
         print(f"Weights & Biases initialized: {wandb.run.name}")
 
     # Setup CSV logging with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"training_log_{timestamp}.csv"
+    csv_filename = f"diffusion_training_log_{timestamp}.csv"
     csv_path = os.path.join(model_dir, csv_filename)
     csv_exists = os.path.exists(csv_path)
 
     # Define CSV headers
-    csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate", "epoch_time", "data_loading_time", "forward_backward_time"]
+    csv_headers = [
+        "epoch",
+        "train_loss",
+        "learning_rate",
+        "epoch_time",
+        "data_loading_time",
+        "forward_backward_time",
+    ]
     if val_dataloader:
-        csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "validation_time"])
+        csv_headers.extend(
+            [
+                "val_loss",
+                "val_mae",
+                "val_mse",
+                "val_rmse",
+                "val_psnr",
+                "val_r2",
+                "validation_time",
+            ]
+        )
 
-    # Open CSV file for writing (append if resuming training)
-    csv_file = open(csv_path, mode='a', newline='')
+    # Open CSV file for writing
+    csv_file = open(csv_path, mode="a", newline="")
     csv_writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
 
     # Write header if file is new
@@ -355,7 +350,9 @@ def train_regression_model(
         batch_start_time = time.time()
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
-        for batch_idx, (input_img, target_img, resolution, thickness) in enumerate(pbar):
+        for batch_idx, (input_img, target_img, resolution, thickness) in enumerate(
+            pbar
+        ):
             # Data loading time
             data_loading_time += time.time() - batch_start_time
 
@@ -365,40 +362,24 @@ def train_regression_model(
             input_img = input_img.to(device)
             target_img = target_img.to(device)
             resolution = resolution.to(device)
-            thickness = thickness.to(device)
 
-            # # Log shapes and resolution every 50 batches
-            # # if batch_idx % 50 == 0:
-            # print(f"\nBatch {batch_idx}: Input shape: {input_img.shape}, Target shape: {target_img.shape}")
-            # print(f"Resolution: {resolution.cpu().numpy().flatten()}, Thickness: {thickness.cpu().numpy().flatten()}")
-            # print(f"Input range: [{input_img.min().item():.4f}, {input_img.max().item():.4f}], Target range: [{target_img.min().item():.4f}, {target_img.max().item():.4f}]")
+            # Prepare resolution conditioning (if enabled)
+            res_cond = resolution if use_resolution_conditioning else None
 
-            # # Save intermediate input and target images for debugging
-            # import nibabel as nib
-            # import numpy as np
-
-            # # Save each image in the batch separately
-            # for b in range(input_img.shape[0]):
-            #     # Index batch first, then remove channel dimension
-            #     input_img_np = input_img[b].squeeze(0).cpu().numpy()  # Shape: (128, 128, 128)
-            #     target_img_np = target_img[b].squeeze(0).cpu().numpy()  # Shape: (128, 128, 128)
-
-            #     input_nii = nib.Nifti1Image(input_img_np, np.eye(4))
-            #     target_nii = nib.Nifti1Image(target_img_np, np.eye(4))
-
-            #     # Include batch index in filename
-            #     nib.save(input_nii, f"debug_input_epoch{epoch+1}_batch{batch_idx+1}_sample{b+1}.nii.gz")
-            #     nib.save(target_nii, f"debug_target_epoch{epoch+1}_batch{batch_idx+1}_sample{b+1}.nii.gz")
-
-            # break  # --- DEBUGGING ONLY ---
-
-            # Forward pass
-            output = model(input_img)
-            loss = criterion(output, target_img)
+            # Compute diffusion loss
+            loss, predicted_noise = model.get_loss(
+                hr_image=target_img,
+                lr_condition=input_img,
+                resolution=res_cond,
+            )
 
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             # Step the learning rate scheduler after each batch
@@ -426,6 +407,7 @@ def train_regression_model(
             val_start_time = time.time()
             model.eval()
             val_epoch_loss = 0.0
+
             # Accumulate metrics across validation set
             metrics_sum = {
                 "mae": 0.0,
@@ -437,56 +419,34 @@ def train_regression_model(
             num_val_batches = 0
 
             with torch.no_grad():
-                if use_sliding_window_val:
-                    # Use sliding window inference for accurate full-volume validation
-                    print(f"\n  Running sliding window validation...")
-                    for input_img, target_img, resolution, thickness in val_dataloader:
-                        input_img = input_img.to(device)
-                        target_img = target_img.to(device)
+                for input_img, target_img, resolution, thickness in val_dataloader:
+                    input_img = input_img.to(device)
+                    target_img = target_img.to(device)
+                    resolution = resolution.to(device)
 
-                        # Process each sample in batch with sliding window
-                        for b in range(input_img.shape[0]):
-                            input_sample = input_img[b:b+1]
-                            target_sample = target_img[b:b+1]
+                    # Compute validation loss (same as training)
+                    res_cond = resolution if use_resolution_conditioning else None
+                    loss, _ = model.get_loss(
+                        hr_image=target_img,
+                        lr_condition=input_img,
+                        resolution=res_cond,
+                    )
+                    val_epoch_loss += loss.item()
 
-                            # Run sliding window inference
-                            output_sample = sliding_window_inference(
-                                model=model,
-                                volume=input_sample,
-                                patch_size=output_shape,
-                                overlap=sw_overlap,
-                                batch_size=sw_batch_size,
-                                device=device,
-                                blend_mode="gaussian",
-                                progress=False,
-                            )
+                    # Generate sample for metrics (using fewer inference steps)
+                    generated = model.sample(
+                        lr_condition=input_img,
+                        resolution=res_cond,
+                        num_inference_steps=num_inference_steps,
+                    )
 
-                            # Calculate loss and metrics
-                            loss = criterion(output_sample, target_sample)
-                            val_epoch_loss += loss.item()
-
-                            batch_metrics = calculate_metrics(output_sample, target_sample, max_val=1.0)
-                            for key in metrics_sum:
-                                metrics_sum[key] += batch_metrics[key]
-                            num_val_batches += 1
-                else:
-                    # Standard patch-based validation (faster)
-                    for input_img, target_img, resolution, thickness in val_dataloader:
-                        input_img = input_img.to(device)
-                        target_img = target_img.to(device)
-                        output = model(input_img)
-                        loss = criterion(output, target_img)
-                        val_epoch_loss += loss.item()
-
-                        # Calculate metrics for this batch
-                        batch_metrics = calculate_metrics(output, target_img, max_val=1.0)
-                        for key in metrics_sum:
-                            metrics_sum[key] += batch_metrics[key]
-                        num_val_batches += 1
+                    # Calculate metrics
+                    batch_metrics = calculate_metrics(generated, target_img, max_val=1.0)
+                    for key in metrics_sum:
+                        metrics_sum[key] += batch_metrics[key]
+                    num_val_batches += 1
 
             val_loss = val_epoch_loss / num_val_batches
-
-            # Average metrics across batches
             val_metrics = {k: v / num_val_batches for k, v in metrics_sum.items()}
 
             validation_time = time.time() - val_start_time
@@ -519,80 +479,60 @@ def train_regression_model(
         # Log metrics to CSV
         log_data = {
             "epoch": epoch + 1,
-            "loss_type": loss_name,
             "train_loss": avg_loss,
-            "learning_rate": optimizer.param_groups[0]['lr'],
+            "learning_rate": optimizer.param_groups[0]["lr"],
             "epoch_time": epoch_time,
             "data_loading_time": data_loading_time,
             "forward_backward_time": forward_backward_time,
         }
 
         if val_dataloader and val_loss is not None and val_metrics is not None:
-            log_data.update({
-                "val_loss": val_loss,
-                "val_mae": val_metrics['mae'],
-                "val_mse": val_metrics['mse'],
-                "val_rmse": val_metrics['rmse'],
-                "val_psnr": val_metrics['psnr'],
-                "val_r2": val_metrics['r2'],
-                "validation_time": validation_time,
-            })
+            log_data.update(
+                {
+                    "val_loss": val_loss,
+                    "val_mae": val_metrics["mae"],
+                    "val_mse": val_metrics["mse"],
+                    "val_rmse": val_metrics["rmse"],
+                    "val_psnr": val_metrics["psnr"],
+                    "val_r2": val_metrics["r2"],
+                    "validation_time": validation_time,
+                }
+            )
 
         csv_writer.writerow(log_data)
-        csv_file.flush()  # Ensure data is written immediately
+        csv_file.flush()
 
         # Log to Weights & Biases
         if use_wandb:
             wandb_log_data = {
                 "epoch": epoch + 1,
                 "train/loss": avg_loss,
-                "train/learning_rate": optimizer.param_groups[0]['lr'],
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
                 "timing/epoch_time": epoch_time,
                 "timing/data_loading_time": data_loading_time,
                 "timing/forward_backward_time": forward_backward_time,
             }
 
             if val_dataloader and val_loss is not None and val_metrics is not None:
-                wandb_log_data.update({
-                    "val/loss": val_loss,
-                    "val/mae": val_metrics['mae'],
-                    "val/mse": val_metrics['mse'],
-                    "val/rmse": val_metrics['rmse'],
-                    "val/psnr": val_metrics['psnr'],
-                    "val/r2": val_metrics['r2'],
-                    "timing/validation_time": validation_time,
-                })
+                wandb_log_data.update(
+                    {
+                        "val/loss": val_loss,
+                        "val/mae": val_metrics["mae"],
+                        "val/mse": val_metrics["mse"],
+                        "val/rmse": val_metrics["rmse"],
+                        "val/psnr": val_metrics["psnr"],
+                        "val/r2": val_metrics["r2"],
+                        "timing/validation_time": validation_time,
+                    }
+                )
 
             wandb.log(wandb_log_data)
 
         # Save checkpoint at specified intervals
         if (epoch + 1) % save_interval == 0:
             checkpoint_path = os.path.join(
-                model_dir, f"regression_unet_epoch_{epoch + 1:04d}.pth"
+                model_dir, f"diffusion_model_epoch_{epoch + 1:04d}.pth"
             )
-
-            # Build model config based on architecture
-            if model_architecture == "unet3d":
-                model_config = {
-                    "model_architecture": "unet3d",
-                    "nb_features": 24,
-                    "input_shape": (1, *output_shape),
-                    "nb_levels": 5,
-                    "conv_size": 3,
-                    "nb_labels": 1,
-                    "feat_mult": 2,
-                    "final_pred_activation": "linear",
-                    "nb_conv_per_level": 2,
-                }
-            else:  # monai
-                model_config = {
-                    "model_architecture": "monai",
-                    "model_name": model_name,
-                    "output_shape": output_shape,
-                    "in_channels": 1,
-                    "out_channels": 1,
-                }
-
             save_model_checkpoint(
                 filepath=checkpoint_path,
                 model=model,
@@ -600,8 +540,15 @@ def train_regression_model(
                 epoch=epoch,
                 loss=avg_loss,
                 val_loss=val_loss,
-                model_type=model_architecture,
-                model_config=model_config,
+                model_type="diffusion",
+                model_config={
+                    "scheduler_type": scheduler_type,
+                    "num_train_timesteps": num_train_timesteps,
+                    "beta_schedule": beta_schedule,
+                    "model_channels": model_channels,
+                    "output_shape": output_shape,
+                    "model_size": model_size,  
+                },
                 scheduler_state_dict=scheduler.state_dict(),
             )
             print(f"Saved checkpoint: {checkpoint_path}")
@@ -611,37 +558,21 @@ def train_regression_model(
     print(f"Training log saved to: {csv_path}")
 
     # Save final model
-    final_path = os.path.join(model_dir, "regression_unet_final.pth")
-
-    # Build model config based on architecture
-    if model_architecture == "unet3d":
-        model_config = {
-            "model_architecture": "unet3d",
-            "nb_features": 24,
-            "input_shape": (1, *output_shape),
-            "nb_levels": 5,
-            "conv_size": 3,
-            "nb_labels": 1,
-            "feat_mult": 2,
-            "final_pred_activation": "linear",
-            "nb_conv_per_level": 2,
-        }
-    else:  # monai
-        model_config = {
-            "model_architecture": "monai",
-            "model_name": model_name,
-            "output_shape": output_shape,
-            "in_channels": 1,
-            "out_channels": 1,
-        }
-
+    final_path = os.path.join(model_dir, "diffusion_model_final.pth")
     save_model_checkpoint(
         filepath=final_path,
         model=model,
         optimizer=optimizer,
         epoch=epochs - 1,
-        model_type=model_architecture,
-        model_config=model_config,
+        model_type="diffusion",
+        model_config={
+            "scheduler_type": scheduler_type,
+            "num_train_timesteps": num_train_timesteps,
+            "beta_schedule": beta_schedule,
+            "model_channels": model_channels,
+            "output_shape": output_shape,
+            "model_size": model_size, 
+        },
         scheduler_state_dict=scheduler.state_dict(),
     )
     print(f"Training complete! Final model saved to: {final_path}")
@@ -650,9 +581,9 @@ def train_regression_model(
     if use_wandb:
         # Save final model as artifact
         artifact = wandb.Artifact(
-            name=f"model-{wandb.run.id}",
+            name=f"diffusion-model-{wandb.run.id}",
             type="model",
-            description="Final trained SynthSR UNet3D model",
+            description="Final trained SynthSR Diffusion model",
         )
         artifact.add_file(final_path)
         wandb.log_artifact(artifact)
@@ -667,7 +598,9 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
 
-    parser = argparse.ArgumentParser(description="Train SynthSR++ model with MONAI")
+    parser = argparse.ArgumentParser(
+        description="Train SynthSR Diffusion model with diffusers"
+    )
 
     # Data source arguments
     parser.add_argument(
@@ -693,26 +626,10 @@ if __name__ == "__main__":
         help="MRI classification types to include (e.g., T1 T2 FLAIR). If not specified, all types are included.",
     )
     parser.add_argument(
-        "--model_dir", type=str, required=True, help="Directory to save trained models"
-    )
-
-    # Model architecture arguments
-    parser.add_argument(
-        "--model_architecture",
+        "--model_dir",
         type=str,
-        default="unet3d",
-        choices=["unet3d", "monai"],
-        help="Model architecture: 'unet3d' (original) or 'monai' (MONAI models)",
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default=None,
-        help=(
-            "Specific MONAI model name (only used if --model_architecture=monai). "
-            "Examples: segresnet_base, unet_base, swinunetr_small, attention_unet. "
-            "Run 'python -m src.models' to see all available models."
-        ),
+        required=True,
+        help="Directory to save trained models",
     )
 
     # Model and data parameters
@@ -758,13 +675,65 @@ if __name__ == "__main__":
         "--no_bias_field", action="store_true", help="Disable bias field corruption"
     )
     parser.add_argument(
-        "--no_intensity_aug", action="store_true", help="Disable intensity augmentation"
+        "--no_intensity_aug",
+        action="store_true",
+        help="Disable intensity augmentation",
     )
     parser.add_argument(
-        "--enable_90_rotations", action="store_true", help="Enable 90-degree rotations"
+        "--enable_90_rotations",
+        action="store_true",
+        help="Enable 90-degree rotations",
     )
     parser.add_argument(
-        "--disable_clip", action="store_true", help="Disable clipping to [0, 1] range"
+        "--disable_clip",
+        action="store_true",
+        help="Disable clipping to [0, 1] range",
+    )
+
+    # Diffusion model parameters
+    parser.add_argument(
+        "--scheduler_type",
+        type=str,
+        default="ddpm",
+        choices=["ddpm", "ddim"],
+        help="Type of noise scheduler (ddpm or ddim)",
+    )
+    parser.add_argument(
+        "--num_train_timesteps",
+        type=int,
+        default=1000,
+        help="Number of diffusion timesteps for training",
+    )
+    parser.add_argument(
+        "--beta_schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "scaled_linear", "squaredcos_cap_v2"],
+        help="Beta schedule type",
+    )
+    parser.add_argument(
+        "--model_channels",
+        type=int,
+        default=64,
+        help="Base number of channels in UNet (default: 64)",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50,
+        help="Number of inference steps for validation sampling",
+    )
+    parser.add_argument(
+        "--no_resolution_conditioning",
+        action="store_true",
+        help="Disable resolution conditioning",
+    )
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        default="base",
+        choices=["tiny", "small", "base", "large"],
+        help="Model size preset for HF model (default: base)",
     )
 
     # Training parameters
@@ -776,13 +745,6 @@ if __name__ == "__main__":
         "--learning_rate", type=float, default=1e-4, help="Learning rate"
     )
     parser.add_argument(
-        "--loss",
-        type=str,
-        default="l1",
-        choices=["l1", "l2", "huber", "ssim", "l1+ssim"],
-        help="Loss function: l1 (MAE), l2 (MSE), huber, ssim, or l1+ssim",
-    )
-    parser.add_argument(
         "--device", type=str, default="cuda", help="Device: cuda or cpu"
     )
     parser.add_argument(
@@ -792,7 +754,10 @@ if __name__ == "__main__":
         help="Path to checkpoint to resume training",
     )
     parser.add_argument(
-        "--save_interval", type=int, default=10, help="Save checkpoint every N epochs"
+        "--save_interval",
+        type=int,
+        default=10,
+        help="Save checkpoint every N epochs",
     )
     parser.add_argument(
         "--num_workers",
@@ -803,27 +768,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_cache",
         action="store_true",
-        help="Use MONAI CacheDataset for faster loading (caches preprocessed images)",
+        help="Use MONAI CacheDataset for faster loading",
     )
 
     # Validation arguments
-    parser.add_argument(
-        "--use_sliding_window_val",
-        action="store_true",
-        help="Use sliding window inference for validation (accurate full-volume metrics, slower)",
-    )
-    parser.add_argument(
-        "--sw_overlap",
-        type=float,
-        default=0.5,
-        help="Overlap ratio for sliding window validation (0.0-0.9, default: 0.5)",
-    )
-    parser.add_argument(
-        "--sw_batch_size",
-        type=int,
-        default=4,
-        help="Batch size for sliding window patches during validation (default: 4)",
-    )
     parser.add_argument(
         "--val_image_dir",
         type=str,
@@ -840,8 +788,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_project",
         type=str,
-        default="synthsr",
-        help="W&B project name (default: synthsr)",
+        default="synthsr-diffusion",
+        help="W&B project name (default: synthsr-diffusion)",
     )
     parser.add_argument(
         "--wandb_entity",
@@ -894,17 +842,19 @@ if __name__ == "__main__":
         args=args,
         n_train_samples=len(hr_image_paths),
         n_val_samples=len(val_image_paths) if val_image_paths else 0,
-        training_stage="stage1",
+        training_stage="diffusion",
     )
 
-    # Train regression UNet
-    train_regression_model(
+    # Train diffusion model
+    train_diffusion_model(
         hr_image_paths=hr_image_paths,
         model_dir=args.model_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        loss_name=args.loss,
+        scheduler_type=args.scheduler_type,
+        num_train_timesteps=args.num_train_timesteps,
+        beta_schedule=args.beta_schedule,
         output_shape=tuple(args.output_shape),
         checkpoint=args.checkpoint,
         device=args.device,
@@ -921,13 +871,12 @@ if __name__ == "__main__":
         clip_to_unit_range=not args.disable_clip,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
-        use_sliding_window_val=args.use_sliding_window_val,
-        sw_overlap=args.sw_overlap,
-        sw_batch_size=args.sw_batch_size,
+        num_inference_steps=args.num_inference_steps,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_run_name=args.wandb_run_name,
-        model_architecture=args.model_architecture,
-        model_name=args.model_name,
+        model_channels=args.model_channels,
+        use_resolution_conditioning=not args.no_resolution_conditioning,
+        model_size=args.model_size,
     )

@@ -551,15 +551,6 @@ def save_training_config(
             "n_val_samples": n_val_samples,
             "resumed_from_checkpoint": getattr(args, "checkpoint", None),
         },
-        "model_architecture": {
-            "model_type": "UNet3D",
-            "nb_features": 24,
-            "nb_levels": 5,
-            "conv_size": 3,
-            "nb_labels": 1,
-            "feat_mult": 2,
-            "nb_conv_per_level": 2,
-        },
         "training_parameters": {
             "epochs": getattr(args, "epochs", None),
             "batch_size": getattr(args, "batch_size", None),
@@ -567,17 +558,6 @@ def save_training_config(
             "save_interval": getattr(args, "save_interval", None),
             "device": getattr(args, "device", None),
             "use_cache": getattr(args, "use_cache", None),
-        },
-        "optimizer_parameters": {
-            "optimizer": "Adam",
-            "initial_lr": getattr(args, "learning_rate", None),
-        },
-        "lr_scheduler_parameters": {
-            "scheduler": "ReduceLROnPlateau",
-            "mode": "min",
-            "factor": 0.5,
-            "patience": 10,
-            "min_lr": 1e-7,
         },
         "data_parameters": {
             "output_shape": getattr(args, "output_shape", None),
@@ -589,11 +569,10 @@ def save_training_config(
         },
         "augmentation_parameters": {
             "randomise_res": not getattr(args, "no_randomise_res", False),
-            "apply_deformation": not getattr(args, "no_deformation", False),
+            "apply_lr_deformation": not getattr(args, "no_lr_deformation", False),
             "apply_hr_deformation": not getattr(args, "no_hr_deformation", False),
             "apply_bias_field": not getattr(args, "no_bias_field", False),
             "apply_intensity_aug": not getattr(args, "no_intensity_aug", False),
-            "same_deformation": getattr(args, "same_deformation", False),
             "enable_90_rotations": getattr(args, "enable_90_rotations", False),
         },
         "data_sources": {
@@ -633,6 +612,17 @@ class SSIMLoss(nn.Module):
     def forward(self, pred, target):
         return self.ssim(pred, target)
 
+class L1SSIMLoss(nn.Module):
+    def __init__(self, alpha=0.7):
+        super().__init__()
+        self.ssim_loss = MonaiSSIM(spatial_dims=3)
+        self.l1 = nn.L1Loss()
+        self.alpha = alpha
+
+    def forward(self, pred, target):
+        l1 = self.l1(pred, target)
+        ssim = self.ssim_loss(pred, target)    
+        return self.alpha * l1 + (1 - self.alpha) * ssim
 
 def get_loss_function(loss_name: str):
     """
@@ -652,13 +642,8 @@ def get_loss_function(loss_name: str):
         return nn.HuberLoss(delta=1.0)
     elif loss_name == "ssim":
         return SSIMLoss()
-    elif loss_name == "gaussian_nll":
-        # For Gaussian NLL, we need to predict both mean and variance
-        # This requires model architecture changes, so we'll use MSE as fallback
-        print(
-            "Warning: Gaussian NLL requires model changes (predicting variance). Using MSE instead."
-        )
-        return nn.MSELoss()
+    elif loss_name == "l1+ssim":
+        return L1SSIMLoss()
     else:
         raise ValueError(f"Unknown loss function: {loss_name}")
 
