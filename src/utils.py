@@ -12,7 +12,7 @@ from typing import Tuple, Dict, Any, Optional, List, Union
 
 from monai.losses import SSIMLoss as MonaiSSIM
 
-from .model import UNet3D
+from .models import CustomUNet3D
 
 
 # =============================================================================
@@ -413,16 +413,16 @@ def save_model_checkpoint(
     torch.save(checkpoint, filepath)
 
 
-def load_unet3d_from_checkpoint(
+def load_model_from_checkpoint(
     checkpoint_path: str,
     device: str = "cuda",
     strict: bool = True,
-) -> tuple[UNet3D, Dict[str, Any]]:
+) -> tuple[nn.Module, Dict[str, Any]]:
     """
-    Load UNet3D model from checkpoint with automatic architecture reconstruction.
+    Load any model (CustomUNet3D or MONAI) from checkpoint with automatic architecture reconstruction.
 
     This function reads the architecture configuration from the checkpoint
-    and reconstructs the model, eliminating the need for dummy forward passes.
+    and reconstructs the appropriate model type.
 
     Args:
         checkpoint_path: Path to checkpoint file
@@ -430,15 +430,37 @@ def load_unet3d_from_checkpoint(
         strict: Whether to strictly enforce state_dict key matching
 
     Returns:
-        model: Loaded UNet3D model
+        model: Loaded model (CustomUNet3D or MONAI model)
         checkpoint: Full checkpoint dict with metadata
     """
+    from .models import create_model
+
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     # Check if model config is saved in checkpoint
     if "model_config" in checkpoint:
         config = checkpoint["model_config"]
-        model = UNet3D(**config)
+        model_arch = config.get("model_architecture", "unet3d")
+
+        if model_arch == "unet3d":
+            # Load custom UNet3D
+            model = CustomUNet3D(**config)
+        elif model_arch == "monai":
+            # Load MONAI model using create_model
+            model_name = config["model_name"]
+            img_size = config.get("output_shape", (128, 128, 128))
+            in_channels = config.get("in_channels", 1)
+            out_channels = config.get("out_channels", 1)
+
+            model = create_model(
+                model_name=model_name,
+                img_size=img_size,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                device=None,
+            )
+        else:
+            raise ValueError(f"Unknown model architecture: {model_arch}")
     else:
         # Fallback: Try to infer from saved parameters or use defaults
         # This handles old checkpoints that don't have model_config
@@ -449,7 +471,7 @@ def load_unet3d_from_checkpoint(
             "For best results, re-save checkpoints with model_utils.save_model_checkpoint()"
         )
 
-        model = UNet3D(
+        model = CustomUNet3D(
             nb_features=checkpoint.get("nb_features", 24),
             input_shape=(1, 128, 128, 128),  # Default shape
             nb_levels=checkpoint.get("nb_levels", 5),
@@ -473,6 +495,20 @@ def load_unet3d_from_checkpoint(
     model.eval()
 
     return model, checkpoint
+
+
+def load_unet3d_from_checkpoint(
+    checkpoint_path: str,
+    device: str = "cuda",
+    strict: bool = True,
+) -> tuple[nn.Module, Dict[str, Any]]:
+    """
+    Backward compatibility wrapper for load_model_from_checkpoint.
+
+    Deprecated: Use load_model_from_checkpoint instead.
+    This function is kept for backward compatibility with existing code.
+    """
+    return load_model_from_checkpoint(checkpoint_path, device, strict)
 
 
 def find_latest_checkpoint(model_dir: str) -> Optional[str]:
@@ -550,6 +586,12 @@ def save_training_config(
             "n_train_samples": n_train_samples,
             "n_val_samples": n_val_samples,
             "resumed_from_checkpoint": getattr(args, "checkpoint", None),
+        },
+        "model_parameters": {
+            "model_architecture": getattr(args, "model_architecture", None),
+            "model_name": getattr(args, "model_name", None),
+            "nb_features": getattr(args, "nb_features", 24),
+            "nb_levels": getattr(args, "nb_levels", 5),
         },
         "training_parameters": {
             "epochs": getattr(args, "epochs", None),

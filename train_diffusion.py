@@ -192,7 +192,54 @@ def train_diffusion_model(
         )
         print(f"Validation dataset: {len(val_dataset)} images")
 
-    # Create diffusion model
+    # Auto-detect checkpoint first (before creating model)
+    start_epoch = 0
+    checkpoint_data = None
+
+    # If no checkpoint specified, try to find the latest one automatically
+    if checkpoint is None:
+        checkpoint = find_latest_checkpoint(model_dir)
+        if checkpoint:
+            print(f"Auto-detected checkpoint: {checkpoint}")
+
+    # Smart checkpoint loading: Override model config from checkpoint if resuming
+    if checkpoint and os.path.exists(checkpoint):
+        print(f"Loading checkpoint from {checkpoint}")
+        checkpoint_data = torch.load(checkpoint, map_location="cpu")
+
+        # Override diffusion model config from checkpoint if available
+        if "model_config" in checkpoint_data:
+            saved_config = checkpoint_data["model_config"]
+            saved_scheduler = saved_config.get("scheduler_type", scheduler_type)
+            saved_timesteps = saved_config.get("num_train_timesteps", num_train_timesteps)
+            saved_model_size = saved_config.get("model_size", model_size)
+            saved_output_shape = saved_config.get("output_shape", output_shape)
+
+            # Warn if user specified different configuration
+            config_differs = (
+                scheduler_type != saved_scheduler or
+                num_train_timesteps != saved_timesteps or
+                model_size != saved_model_size
+            )
+
+            if config_differs:
+                print(f"⚠️  Checkpoint has different model configuration!")
+                print(f"   Command-line: {scheduler_type} / {num_train_timesteps} steps / {model_size}")
+                print(f"   Checkpoint:   {saved_scheduler} / {saved_timesteps} steps / {saved_model_size}")
+                print(f"   → Using checkpoint's configuration for consistency")
+
+            # Use checkpoint's configuration
+            scheduler_type = saved_scheduler
+            num_train_timesteps = saved_timesteps
+            model_size = saved_model_size
+            output_shape = saved_output_shape
+
+        start_epoch = checkpoint_data.get("epoch", 0) + 1
+        print(f"Resuming training from epoch {start_epoch}")
+    else:
+        print("No checkpoint found. Starting training from scratch.")
+
+    # Create diffusion model (now potentially from checkpoint config)
     print(f"Scheduler type: {scheduler_type}, Timesteps: {num_train_timesteps}")
     print(f"Resolution conditioning: {use_resolution_conditioning}")
 
@@ -206,29 +253,14 @@ def train_diffusion_model(
         num_train_timesteps=num_train_timesteps,
         beta_schedule=beta_schedule,
     )
-    
+
     # Move model to device
     model = model.to(device)
 
-    # Auto-detect and load checkpoint
-    start_epoch = 0
-    checkpoint_data = None
-
-    # If no checkpoint specified, try to find the latest one automatically
-    if checkpoint is None:
-        checkpoint = find_latest_checkpoint(model_dir)
-        if checkpoint:
-            print(f"Auto-detected checkpoint: {checkpoint}")
-
-    # Load checkpoint if available
-    if checkpoint and os.path.exists(checkpoint):
-        print(f"Loading checkpoint from {checkpoint}")
-        checkpoint_data = torch.load(checkpoint, map_location=device)
+    # Load checkpoint weights if available
+    if checkpoint_data is not None:
         model.load_state_dict(checkpoint_data["model_state_dict"])
-        start_epoch = checkpoint_data.get("epoch", 0) + 1
-        print(f"Resuming training from epoch {start_epoch}")
-    else:
-        print("No checkpoint found. Starting training from scratch.")
+        print(f"✓ Loaded model weights from checkpoint")
 
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)

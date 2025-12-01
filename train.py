@@ -18,7 +18,6 @@ from transformers import get_cosine_schedule_with_warmup
 from monai.data import DataLoader
 
 # Import our modules
-from src.model import UNet3D 
 from src.models import create_model, list_available_models  
 from src.utils import (
     save_model_checkpoint,
@@ -191,24 +190,59 @@ def train_regression_model(
         )
         print(f"Validation dataset: {len(val_dataset)} images")
 
-    # Create model based on architecture choice
+    # Auto-detect checkpoint first (before creating model)
+    start_epoch = 0
+    checkpoint_data = None
+
+    # If no checkpoint specified, try to find the latest one automatically
+    if checkpoint is None:
+        checkpoint = find_latest_checkpoint(model_dir)
+        if checkpoint:
+            print(f"Auto-detected checkpoint: {checkpoint}")
+
+    # Smart checkpoint loading: Override model config from checkpoint if resuming
+    if checkpoint and os.path.exists(checkpoint):
+        print(f"Loading checkpoint from {checkpoint}")
+        checkpoint_data = torch.load(checkpoint, map_location="cpu")
+
+        # Override model architecture from checkpoint if available
+        if "model_config" in checkpoint_data:
+            saved_config = checkpoint_data["model_config"]
+            saved_arch = saved_config.get("model_architecture", model_architecture)
+            saved_model_name = saved_config.get("model_name", model_name)
+
+            # Warn if user specified different architecture
+            if model_architecture != saved_arch or (model_name and model_name != saved_model_name):
+                print(f"⚠️  Checkpoint has different model configuration!")
+                print(f"   Command-line: {model_architecture} / {model_name}")
+                print(f"   Checkpoint:   {saved_arch} / {saved_model_name}")
+                print(f"   → Using checkpoint's configuration for consistency")
+
+            # Use checkpoint's architecture
+            model_architecture = saved_arch
+            model_name = saved_model_name
+            output_shape = saved_config.get("output_shape", output_shape)
+
+        start_epoch = checkpoint_data.get("epoch", 0) + 1
+        print(f"Resuming training from epoch {start_epoch}")
+    else:
+        print("No checkpoint found. Starting training from scratch.")
+
+    # Create model based on architecture choice (now potentially from checkpoint)
     print(f"Model architecture: {model_architecture}")
 
     if model_architecture == "unet3d":
-        # Use original UNet3D from src.model
-        print("Creating original UNet3D model")
-        model = UNet3D(
-            nb_features=24,
-            input_shape=(1, *output_shape),
-            nb_levels=5,
-            conv_size=3,
-            nb_labels=1,
-            feat_mult=2,
-            final_pred_activation="linear",
-            nb_conv_per_level=2,
+        # Use custom UNet3D (original SynthSR architecture)
+        print("Creating original SynthSR UNet3D model")
+        model = create_model(
+            model_name="custom_unet3d_base",
+            img_size=output_shape,
+            in_channels=1,
+            out_channels=1,
+            device=None,  # We'll move to device after
         )
     elif model_architecture == "monai":
-        # Use MONAI models from src.models
+        # Use MONAI models from unified registry
         if model_name is None:
             model_name = "segresnet_base"  # Default to SegResNet
 
@@ -223,7 +257,7 @@ def train_regression_model(
     else:
         raise ValueError(
             f"Unknown model_architecture: {model_architecture}. "
-            f"Choose 'unet3d' (original) or 'monai' (MONAI models)"
+            f"Choose 'unet3d' (original SynthSR) or 'monai' (MONAI models)"
         )
 
     # Move model to device
@@ -231,25 +265,10 @@ def train_regression_model(
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Auto-detect and load checkpoint
-    start_epoch = 0
-    checkpoint_data = None
-
-    # If no checkpoint specified, try to find the latest one automatically
-    if checkpoint is None:
-        checkpoint = find_latest_checkpoint(model_dir)
-        if checkpoint:
-            print(f"Auto-detected checkpoint: {checkpoint}")
-
-    # Load checkpoint if available
-    if checkpoint and os.path.exists(checkpoint):
-        print(f"Loading checkpoint from {checkpoint}")
-        checkpoint_data = torch.load(checkpoint, map_location=device)
+    # Load checkpoint weights if available
+    if checkpoint_data is not None:
         model.load_state_dict(checkpoint_data["model_state_dict"])
-        start_epoch = checkpoint_data.get("epoch", 0) + 1
-        print(f"Resuming training from epoch {start_epoch}")
-    else:
-        print("No checkpoint found. Starting training from scratch.")
+        print(f"✓ Loaded model weights from checkpoint")
 
     # Optimizer and loss
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -575,6 +594,7 @@ def train_regression_model(
             if model_architecture == "unet3d":
                 model_config = {
                     "model_architecture": "unet3d",
+                    "model_name": "custom_unet3d_base",  # Explicit model name
                     "nb_features": 24,
                     "input_shape": (1, *output_shape),
                     "nb_levels": 5,
@@ -617,6 +637,7 @@ def train_regression_model(
     if model_architecture == "unet3d":
         model_config = {
             "model_architecture": "unet3d",
+            "model_name": "custom_unet3d_base",  # Explicit model name
             "nb_features": 24,
             "input_shape": (1, *output_shape),
             "nb_levels": 5,

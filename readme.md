@@ -39,10 +39,14 @@ pip install nibabel numpy scipy tqdm matplotlib streamlit
 
 ### Training
 
-Train a super-resolution model on high-resolution MRI scans:
+#### Model Architectures
 
+The project supports multiple model architectures through a unified registry:
+
+**Custom UNet3D (Original SynthSR)**
 ```bash
 python train.py \
+    --model_architecture unet3d \
     --hr_image_dir /path/to/hr/images \
     --model_dir ./models \
     --epochs 100 \
@@ -51,7 +55,35 @@ python train.py \
     --output_shape 128 128 128
 ```
 
+**MONAI Models (SegResNet, SwinUNETR, etc.)**
+```bash
+# SegResNet (Recommended - Fast & Efficient)
+python train.py \
+    --model_architecture monai \
+    --model_name segresnet_base \
+    --hr_image_dir /path/to/hr/images \
+    --model_dir ./models
+
+# SwinUNETR (Transformer-based)
+python train.py \
+    --model_architecture monai \
+    --model_name swinunetr_base \
+    --hr_image_dir /path/to/hr/images \
+    --model_dir ./models
+
+# Other available models: unetr, vnet, attention_unet, etc.
+```
+
+**Available Model Presets:**
+- `custom_unet3d_base` - Original SynthSR architecture
+- `segresnet_base` - Efficient residual U-Net (Recommended)
+- `swinunetr_base` - Transformer-based (High performance, more memory)
+- `unetr_base` - Vision Transformer U-Net
+- `unet_base` - Standard MONAI U-Net
+
 **Key Parameters:**
+- `--model_architecture`: `unet3d` (custom) or `monai` (MONAI models)
+- `--model_name`: Specific model preset (for MONAI architecture)
 - `--hr_image_dir`: Directory containing high-resolution NIfTI images
 - `--model_dir`: Directory to save model checkpoints
 - `--atlas_res`: Target resolution in mm (x, y, z)
@@ -59,10 +91,29 @@ python train.py \
 - `--max_res_aniso`: Maximum anisotropic resolution (default: 9.0 9.0 9.0)
 - `--use_cache`: Enable MONAI CacheDataset for faster training
 
+**Smart Checkpoint Resumption:**
+
+The training automatically detects model architecture from checkpoints:
+
+```bash
+# Just specify the checkpoint - model type is auto-detected!
+python train.py --checkpoint ./models/regression_unet_epoch_0050.pth
+
+# Or let it auto-find the latest checkpoint:
+python train.py --model_dir ./models  # Automatically resumes if checkpoint exists
+```
+
+⚠️ If you specify different `--model_architecture` than the checkpoint, it will:
+1. Warn you about the mismatch
+2. Override with checkpoint's configuration
+3. Resume with the correct architecture
+
 **Data Augmentation Control:**
 ```bash
 # Disable specific augmentations
 python train.py \
+    --model_architecture monai \
+    --model_name segresnet_base \
     --hr_image_dir /path/to/hr/images \
     --model_dir ./models \
     --no_randomise_res \
@@ -73,6 +124,8 @@ python train.py \
 **CSV-based Training:**
 ```bash
 python train.py \
+    --model_architecture monai \
+    --model_name segresnet_base \
     --csv_file data.csv \
     --base_dir /path/to/data \
     --model_dir ./models
@@ -82,10 +135,10 @@ CSV format: `filename,split` where split is `train` or `val`.
 
 ### Inference
 
-Run super-resolution on new images:
+Run super-resolution on new images. The inference automatically detects model architecture from checkpoint:
 
 ```bash
-# Single file
+# Single file - Works with ANY model type!
 python test.py \
     --input /path/to/input.nii.gz \
     --output output_sr.nii.gz \
@@ -99,6 +152,16 @@ python test.py \
     --model ./models/regression_unet_final.pth \
     --tta  # Enable test-time augmentation
 ```
+
+**Automatic Model Detection:**
+
+The inference script automatically loads the correct architecture based on the checkpoint:
+- ✅ CustomUNet3D checkpoints → Loads CustomUNet3D
+- ✅ SegResNet checkpoints → Loads SegResNet
+- ✅ SwinUNETR checkpoints → Loads SwinUNETR
+- ✅ Any other MONAI model → Loads correctly
+
+No need to specify model architecture during inference!
 
 **Options:**
 - `--tta`: Enable test-time augmentation (averaging with flipped predictions)
@@ -123,15 +186,20 @@ Features:
 ## Project Structure
 
 ```
-synthsr_monai/
-├── train.py                    # Training script
-├── test.py                     # Inference script
+synthSR/
+├── train.py                    # Training script (supports all architectures)
+├── train_diffusion.py          # Diffusion model training
+├── test.py                     # Inference script (auto-detects architecture)
+├── test_diffusion.py           # Diffusion inference
 ├── streamlit_lr_viewer.py      # Interactive visualization tool
 ├── src/
-│   ├── model.py               # UNet3D architecture
-│   ├── data.py                # Data loading and LR-HR pair generation
+│   ├── models.py              # Unified model registry (Custom + MONAI)
+│   ├── diff_models.py         # Diffusion models
+│   ├── data_fft.py            # Data loading and LR-HR pair generation
 │   ├── domain_rand.py         # Augmentation transforms
 │   └── utils.py               # Utilities and checkpoint management
+├── Dockerfile                  # Docker container definition
+├── requirements.txt            # Python dependencies
 └── README.md
 ```
 
@@ -148,14 +216,42 @@ The training pipeline simulates realistic low-resolution acquisitions through:
    - Gaussian noise injection
    - Upsampling to original shape
 
-## Model Architecture
+## Model Architectures
 
+The project supports multiple model architectures through a unified interface:
+
+### Custom UNet3D (Original SynthSR)
 - **Network**: 3D U-Net with 5 levels
 - **Features**: 24 base features (doubled at each level)
 - **Input/Output**: Single-channel 3D volumes
 - **Activation**: Linear (regression task)
-- **Loss**: L1 (Mean Absolute Error)
-- **Optimizer**: Adam with ReduceLROnPlateau scheduler
+- **Parameters**: ~1.2M
+
+### MONAI Models
+
+**SegResNet (Recommended)**
+- **Network**: Residual encoder-decoder with VAE regularization
+- **Features**: Efficient design with residual blocks
+- **Best for**: Fast training, good performance-to-cost ratio
+- **Parameters**: Variable based on configuration
+
+**SwinUNETR**
+- **Network**: Swin Transformer encoder + CNN decoder
+- **Features**: Hierarchical vision transformer
+- **Best for**: High performance, capturing long-range dependencies
+- **Parameters**: ~62M (larger memory footprint)
+
+**Other Available Models:**
+- **UNETR**: Vision Transformer U-Net
+- **Attention U-Net**: U-Net with attention gates
+- **V-Net**: 3D architecture with residual connections
+- **DynUNet**: Highly configurable dynamic U-Net
+
+### Training Configuration
+- **Loss**: L1 (Mean Absolute Error), SSIM, or combined
+- **Optimizer**: Adam with Cosine LR schedule + warmup
+- **Data**: Resolution-agnostic training with domain randomization
+- **Augmentation**: Deformation, bias field, intensity, resolution randomization
 
 ## Citation
 
