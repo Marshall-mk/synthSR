@@ -8,6 +8,7 @@ monai==1.5.1
 wandb
 diffusers==0.35.1
 transformers==4.56.1
+einops
 # Optional dependencies for visualization
 scipy
 matplotlib

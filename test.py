@@ -46,9 +46,9 @@ def create_inference_transforms(atlas_res=[1.0, 1.0, 1.0]):
     """
     return Compose(
         [
-            LoadImaged(keys=["image"]),  # Keep metadata for saving
+            LoadImaged(keys=["image"], image_only=False),  # Keep metadata for saving
             EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),  # Add channel dimension if not present
-            Orientationd(keys=["image"], axcodes="RAS"),  # Align to RAS orientation
+            Orientationd(keys=["image"], axcodes="RAS", labels=None),  # Align to RAS orientation
             Spacingd(keys=["image"], pixdim=atlas_res, mode="bilinear"),  # Resample to target resolution
             ScaleIntensityRangePercentilesd(
                 keys=["image"],
@@ -111,13 +111,33 @@ def predict_single_volume(
     print(f"  After MONAI preprocessing: {volume_for_info.shape}")
 
     # Get affine from metadata if available
+    affine = None
     if "affine" in meta:
         affine = meta["affine"]
         if isinstance(affine, torch.Tensor):
             affine = affine.cpu().numpy()
-    else:
-        # Fallback: create identity affine with atlas resolution
-        affine = np.diag([atlas_res[0], atlas_res[1], atlas_res[2], 1.0])
+        print("  Using affine from MONAI metadata.")
+
+    # If affine still not found, try loading directly from original file
+    if affine is None:
+        try:
+            print("  Affine not in metadata, loading directly from original image...")
+            original_img = nib.load(input_path)
+            affine = original_img.affine.copy()
+
+            # Adjust affine for the resampled resolution
+            # The Spacingd transform updates the affine, but if metadata is lost, we need to scale it
+            original_pixdim = original_img.header.get_zooms()[:3]
+            scale_factors = np.array(original_pixdim) / np.array(atlas_res)
+
+            # Update the affine to reflect the new resolution
+            affine[:3, :3] = affine[:3, :3] / scale_factors[:, np.newaxis] * scale_factors
+            print(f"  Successfully loaded affine from original image (origin: {affine[:3, 3]})")
+        except Exception as e:
+            print(f"  Warning: Could not load affine from original file ({e})")
+            print("  Using fallback affine (identity with atlas resolution).")
+            # Fallback: create identity affine with atlas resolution
+            affine = np.diag([atlas_res[0], atlas_res[1], atlas_res[2], 1.0])
 
     # Save intermediate preprocessed volume if requested
     if save_intermediates:

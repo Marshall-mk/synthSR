@@ -639,7 +639,7 @@ def get_swinunetr(
         spatial_dims: Number of spatial dimensions (3 for 3D)
     """
     return SwinUNETR(
-        img_size=img_size,
+        # img_size=img_size,
         in_channels=in_channels,
         out_channels=out_channels,
         feature_size=feature_size,
@@ -688,7 +688,7 @@ def get_unetr(
         hidden_size=hidden_size,
         mlp_dim=mlp_dim,
         num_heads=num_heads,
-        pos_embed=pos_embed,
+        # pos_embed=pos_embed,
         norm_name=norm_name,
         dropout_rate=dropout_rate,
         spatial_dims=spatial_dims,
@@ -826,7 +826,7 @@ def get_vnet(
         spatial_dims=spatial_dims,
         in_channels=in_channels,
         out_channels=out_channels,
-        dropout_prob=dropout_prob,
+        # dropout_prob=dropout_prob,
         dropout_dim=dropout_dim,
         act=act,
         bias=bias,
