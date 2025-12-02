@@ -445,6 +445,7 @@ def load_model_from_checkpoint(
         if model_arch == "unet3d":
             # Load custom UNet3D
             model = CustomUNet3D(**config)
+            print("Loaded CustomUNet3D model from checkpoint")
         elif model_arch == "monai":
             # Load MONAI model using create_model
             model_name = config["model_name"]
@@ -459,6 +460,7 @@ def load_model_from_checkpoint(
                 out_channels=out_channels,
                 device=None,
             )
+            print(f"Loaded MONAI model: {model_name}")
         else:
             raise ValueError(f"Unknown model architecture: {model_arch}")
     else:
@@ -588,7 +590,7 @@ def save_training_config(
             "resumed_from_checkpoint": getattr(args, "checkpoint", None),
         },
         "model_parameters": {
-            "model_architecture": getattr(args, "model_architecture", None),
+            "model_architecture": getattr(args, "model_architecture", "unet3d"),
             "model_name": getattr(args, "model_name", None),
             "nb_features": getattr(args, "nb_features", 24),
             "nb_levels": getattr(args, "nb_levels", 5),
@@ -597,9 +599,16 @@ def save_training_config(
             "epochs": getattr(args, "epochs", None),
             "batch_size": getattr(args, "batch_size", None),
             "learning_rate": getattr(args, "learning_rate", None),
+            "loss_function": getattr(args, "loss", None),
             "save_interval": getattr(args, "save_interval", None),
             "device": getattr(args, "device", None),
-            "use_cache": getattr(args, "use_cache", None),
+            "use_cache": getattr(args, "use_cache", False),
+            "num_workers": getattr(args, "num_workers", None),
+        },
+        "validation_parameters": {
+            "use_sliding_window_val": getattr(args, "use_sliding_window_val", False),
+            "sw_overlap": getattr(args, "sw_overlap", 0.5),
+            "sw_batch_size": getattr(args, "sw_batch_size", 4),
         },
         "data_parameters": {
             "output_shape": getattr(args, "output_shape", None),
@@ -608,20 +617,27 @@ def save_training_config(
             "min_resolution": getattr(args, "min_resolution", None),
             "max_res_aniso": getattr(args, "max_res_aniso", None),
             "auto_detect_res": getattr(args, "auto_detect_res", None),
+            "mri_classes": getattr(args, "mri_classes", None),
         },
         "augmentation_parameters": {
             "randomise_res": not getattr(args, "no_randomise_res", False),
             "apply_lr_deformation": not getattr(args, "no_lr_deformation", False),
-            "apply_hr_deformation": not getattr(args, "no_hr_deformation", False),
             "apply_bias_field": not getattr(args, "no_bias_field", False),
             "apply_intensity_aug": not getattr(args, "no_intensity_aug", False),
             "enable_90_rotations": getattr(args, "enable_90_rotations", False),
+            "clip_to_unit_range": not getattr(args, "disable_clip", False),
         },
         "data_sources": {
             "hr_image_dir": getattr(args, "hr_image_dir", None),
             "val_image_dir": getattr(args, "val_image_dir", None),
             "csv_file": getattr(args, "csv_file", None),
             "base_dir": getattr(args, "base_dir", None),
+        },
+        "wandb_parameters": {
+            "use_wandb": getattr(args, "use_wandb", False),
+            "wandb_project": getattr(args, "wandb_project", None),
+            "wandb_entity": getattr(args, "wandb_entity", None),
+            "wandb_run_name": getattr(args, "wandb_run_name", None),
         },
         "system_info": {
             "python_version": sys.version,

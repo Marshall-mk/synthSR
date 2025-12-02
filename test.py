@@ -30,7 +30,7 @@ from monai.transforms import (
 from src.utils import (
     pad_to_multiple_of_32,
     unpad_volume,
-    load_unet3d_from_checkpoint,
+    load_model_from_checkpoint,
 )
 
 
@@ -195,7 +195,7 @@ def predict_batch(
 
     # Load model with automatic architecture reconstruction
     print(f"\nLoading model from {model_path}...")
-    model, _ = load_unet3d_from_checkpoint(model_path, device=device)
+    model, _ = load_model_from_checkpoint(model_path, device=device)
     print(f"Model loaded successfully!")
     print(f"Device: {device}")
     print(f"Atlas resolution: {atlas_res} mm")
