@@ -500,7 +500,7 @@ def create_dataset(
         LoadImaged(keys=["image"], image_only=True),
         EnsureChannelFirstd(keys=["image"]),
         # Ensure consistent RAS orientation across heterogeneous data
-        Orientationd(keys=["image"], axcodes="RAS"),
+        Orientationd(keys=["image"], axcodes="RAS", labels=None),
     ]
 
     # Resample to target spacing (atlas resolution)

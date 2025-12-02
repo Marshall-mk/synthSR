@@ -11,9 +11,9 @@ WORKDIR /workspace
 
 EXPOSE 8888
 
-COPY . .
+# COPY . .
 # list all files for debugging
 RUN ls -la .
 # Copy requirements.txt from the current directory and install packages
-# COPY requirements.txt .
+COPY requirements.txt .
 RUN pip3 install -r requirements.txt

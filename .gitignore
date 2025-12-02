@@ -140,6 +140,7 @@ dmypy.json
 *.pt
 *.pth
 *.ckpt
+*.yaml
 *.safetensors
 checkpoints/
 logs/

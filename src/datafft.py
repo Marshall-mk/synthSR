@@ -532,7 +532,7 @@ def create_dataset(
     transforms = [
         LoadImaged(keys=["image"], image_only=True),
         EnsureChannelFirstd(keys=["image"]),
-        Orientationd(keys=["image"], axcodes="RAS"),
+        Orientationd(keys=["image"], axcodes="RAS", labels=None),
     ]
 
     if target_spacing is not None:
