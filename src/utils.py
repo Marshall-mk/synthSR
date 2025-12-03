@@ -513,25 +513,33 @@ def load_unet3d_from_checkpoint(
     return load_model_from_checkpoint(checkpoint_path, device, strict)
 
 
-def find_latest_checkpoint(model_dir: str) -> Optional[str]:
+def find_latest_checkpoint(model_dir: str, model_type: Optional[str] = None) -> Optional[str]:
     """
     Find the most recent checkpoint in the model directory.
 
-    Searches for checkpoint files matching the pattern 'regression_unet_epoch_*.pth'
+    Searches for checkpoint files matching regression or diffusion model patterns
     and returns the one with the highest epoch number. This enables automatic
     training resumption without manually specifying checkpoint paths.
 
     Args:
         model_dir: Directory containing checkpoint files
+        model_type: Type of model checkpoint to search for. Options:
+            - "regression": Search only for regression_unet_epoch_*.pth
+            - "diffusion": Search only for diffusion_model_epoch_*.pth
+            - None (default): Search for both types and return the most recent
 
     Returns:
         Path to the most recent checkpoint, or None if no checkpoints found
 
-    Example:
+    Examples:
+        >>> # Auto-detect most recent checkpoint of any type
         >>> checkpoint = find_latest_checkpoint("./models")
+        >>>
+        >>> # Find only diffusion model checkpoints
+        >>> checkpoint = find_latest_checkpoint("./models", model_type="diffusion")
         >>> if checkpoint:
         ...     print(f"Found checkpoint: {checkpoint}")
-        ...     # Output: Found checkpoint: ./models/regression_unet_epoch_050.pth
+        ...     # Output: Found checkpoint: ./models/diffusion_model_epoch_050.pth
         ... else:
         ...     print("No checkpoints found, starting from scratch")
     """
@@ -539,15 +547,29 @@ def find_latest_checkpoint(model_dir: str) -> Optional[str]:
     if not model_dir.exists():
         return None
 
-    # Find all checkpoint files matching the pattern
-    checkpoint_pattern = re.compile(r"regression_unet_epoch_(\d+)\.pth")
     checkpoints = []
 
-    for file_path in model_dir.glob("regression_unet_epoch_*.pth"):
-        match = checkpoint_pattern.match(file_path.name)
-        if match:
-            epoch_num = int(match.group(1))
-            checkpoints.append((epoch_num, str(file_path)))
+    # Define checkpoint patterns based on model type
+    patterns = []
+    if model_type == "regression":
+        patterns = [("regression_unet_epoch_*.pth", r"regression_unet_epoch_(\d+)\.pth")]
+    elif model_type == "diffusion":
+        patterns = [("diffusion_model_epoch_*.pth", r"diffusion_model_epoch_(\d+)\.pth")]
+    else:
+        # Search for both types if model_type not specified
+        patterns = [
+            ("regression_unet_epoch_*.pth", r"regression_unet_epoch_(\d+)\.pth"),
+            ("diffusion_model_epoch_*.pth", r"diffusion_model_epoch_(\d+)\.pth"),
+        ]
+
+    # Find all checkpoint files matching the patterns
+    for glob_pattern, regex_pattern in patterns:
+        checkpoint_pattern = re.compile(regex_pattern)
+        for file_path in model_dir.glob(glob_pattern):
+            match = checkpoint_pattern.match(file_path.name)
+            if match:
+                epoch_num = int(match.group(1))
+                checkpoints.append((epoch_num, str(file_path)))
 
     if not checkpoints:
         return None
@@ -601,6 +623,7 @@ def save_training_config(
             "learning_rate": getattr(args, "learning_rate", None),
             "loss_function": getattr(args, "loss", None),
             "save_interval": getattr(args, "save_interval", None),
+            "val_interval": getattr(args, "val_interval", None),
             "device": getattr(args, "device", None),
             "use_cache": getattr(args, "use_cache", False),
             "num_workers": getattr(args, "num_workers", None),

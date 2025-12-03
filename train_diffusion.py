@@ -46,6 +46,7 @@ def train_diffusion_model(
     checkpoint: str = None,
     device: str = "cuda",
     save_interval: int = 10,
+    val_interval: int = 1,
     val_image_paths: List[str] = None,
     atlas_res: list = [1.0, 1.0, 1.0],
     min_resolution: list = [1.0, 1.0, 1.0],
@@ -86,6 +87,7 @@ def train_diffusion_model(
         checkpoint: Optional checkpoint to resume from
         device: 'cuda' or 'cpu'
         save_interval: Save checkpoint every N epochs
+        val_interval: Run validation every N epochs
         val_image_paths: Optional list of validation image paths
         atlas_res: Physical resolution of input HR images [x, y, z] in mm
         min_resolution: Minimum resolution for randomization
@@ -227,7 +229,7 @@ def train_diffusion_model(
 
     # If no checkpoint specified, try to find the latest one automatically
     if checkpoint is None:
-        checkpoint = find_latest_checkpoint(model_dir)
+        checkpoint = find_latest_checkpoint(model_dir, model_type="diffusion")
         if checkpoint and accelerator.is_main_process:
             print(f"Auto-detected checkpoint: {checkpoint}")
 
@@ -478,11 +480,11 @@ def train_diffusion_model(
 
         avg_loss = epoch_loss / len(dataloader)
 
-        # Validation
+        # Validation (run only at specified intervals)
         val_loss = None
         val_metrics = None
         validation_time = 0.0
-        if val_dataloader:
+        if val_dataloader and (epoch + 1) % val_interval == 0:
             val_start_time = time.time()
             model.eval()
             val_epoch_loss = 0.0
@@ -862,6 +864,12 @@ if __name__ == "__main__":
         help="Save checkpoint every N epochs",
     )
     parser.add_argument(
+        "--val_interval",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (default: 1 = every epoch)",
+    )
+    parser.add_argument(
         "--num_workers",
         type=int,
         default=None,
@@ -982,6 +990,7 @@ if __name__ == "__main__":
         checkpoint=args.checkpoint,
         device=args.device,
         save_interval=args.save_interval,
+        val_interval=args.val_interval,
         val_image_paths=val_image_paths,
         atlas_res=args.atlas_res,
         min_resolution=args.min_resolution,
