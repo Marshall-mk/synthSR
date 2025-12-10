@@ -694,7 +694,7 @@ class SSIMLoss(nn.Module):
         return self.ssim(pred, target)
 
 class L1SSIMLoss(nn.Module):
-    def __init__(self, alpha=0.7):
+    def __init__(self, alpha=0.5):
         super().__init__()
         self.ssim_loss = MonaiSSIM(spatial_dims=3)
         self.l1 = nn.L1Loss()
@@ -763,12 +763,20 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
         ss_res = ((target - pred) ** 2).sum().item()
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
+        # SSIM (Structural Similarity Index Measure)
+        # MONAI's SSIMLoss returns 1 - SSIM, so we need to invert it
+        # SSIM ranges from -1 to 1, where 1 is perfect similarity
+        ssim_loss_fn = MonaiSSIM(spatial_dims=3, data_range=max_val)
+        ssim_loss = ssim_loss_fn(pred, target).item()
+        ssim = 1 - ssim_loss  # Convert from loss to similarity
+
         return {
             "mae": mae,
             "mse": mse,
             "rmse": rmse,
             "psnr": psnr,
             "r2": r2,
+            "ssim": ssim,
         }
 
 

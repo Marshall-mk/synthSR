@@ -28,6 +28,7 @@ from monai.transforms import (
     GaussianSmooth,
     ScaleIntensityRangePercentiles,
     CenterSpatialCropd,
+    RandAffined,
 )
 
 from .domain_rand import (
@@ -530,6 +531,20 @@ def create_dataset(
                 CenterSpatialCropd(keys=["image"], roi_size=target_shape)
             )
             transforms.append(SpatialPadd(keys=["image"], spatial_size=target_shape))
+        
+    if is_training:
+        transforms.append(
+            RandAffined(
+                keys=["image"],
+                prob=0.3,                       
+                rotate_range=(0.1, 0.1, 0.1),
+                scale_range=(0.1, 0.1, 0.1),
+                shear_range=None,
+                translate_range=(5, 5, 5),     # optional
+                mode="bilinear",
+                padding_mode="border",
+            )
+        )
 
     transforms.append(ToTensord(keys=["image"]))
 

@@ -401,7 +401,7 @@ def train_regression_model(
         # Define CSV headers
         csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate", "epoch_time", "data_loading_time", "forward_backward_time"]
         if val_dataloader:
-            csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "validation_time"])
+            csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"])
 
         # Open CSV file for writing (append if resuming training)
         csv_file = open(csv_path, mode='a', newline='')
@@ -508,6 +508,7 @@ def train_regression_model(
                 "rmse": 0.0,
                 "psnr": 0.0,
                 "r2": 0.0,
+                "ssim": 0.0,
             }
             num_val_batches = 0
 
@@ -574,7 +575,7 @@ def train_regression_model(
                 print(
                     f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | MSE: {val_metrics['mse']:.6f} | "
                     f"RMSE: {val_metrics['rmse']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB | "
-                    f"R²: {val_metrics['r2']:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                    f"R²: {val_metrics['r2']:.4f} | SSIM: {val_metrics['ssim']:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
                 )
                 print(
                     f"  Timing - Epoch: {epoch_time:.1f}s | Data: {data_loading_time:.1f}s | "
@@ -613,6 +614,7 @@ def train_regression_model(
                     "val_rmse": val_metrics['rmse'],
                     "val_psnr": val_metrics['psnr'],
                     "val_r2": val_metrics['r2'],
+                    "val_ssim": val_metrics['ssim'],
                     "validation_time": validation_time,
                 })
 
@@ -638,6 +640,7 @@ def train_regression_model(
                     "val/rmse": val_metrics['rmse'],
                     "val/psnr": val_metrics['psnr'],
                     "val/r2": val_metrics['r2'],
+                    "val/ssim": val_metrics['ssim'],
                     "timing/validation_time": validation_time,
                 })
 

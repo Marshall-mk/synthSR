@@ -1,10 +1,19 @@
 """
-Enhanced Data loading and generation for SynthSR training.
+Data loading and generation for SynthSR training.
 Includes comprehensive k-space artifact simulation and Physics-based PSF blurring.
-"""
 
+This module simulates the MRI acquisition pipeline to generate synthetic Low-Resolution (LR) images
+from High-Resolution (HR) ground truth. It models the physical degradation process including:
+1.  **Slice Profile & Point Spread Function (PSF):** The physical blurring caused by RF excitation profiles and signal decay.
+2.  **B1 Field Inhomogeneity:** Bias fields that cause smooth intensity variations.
+3.  **Contrast Variation:** Gamma correction to simulate different T1/T2 weightings.
+4.  **K-Space Artifacts:** Motion ghosting and spikes in the frequency domain.
+5.  **Sampling Limits:** Resolution loss via FFT cropping (simulating limited k-space acquisition).
+"""
 import torch
 import torch.fft
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from typing import Optional, List, Union, Tuple
@@ -13,16 +22,516 @@ from monai.data import Dataset, CacheDataset
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
     Spacingd, CropForegroundd, RandSpatialCropd, SpatialPadd,
-    ToTensord, GaussianSmooth, ScaleIntensityRangePercentiles,
-    CenterSpatialCropd,
+    ToTensord, ScaleIntensityRangePercentiles,
+    CenterSpatialCropd, Resize, RandAffined,
 )
 
-from .domain_rand import (
-    SampleResolution, RandomSpatialDeformation,
-    BiasFieldCorruption, IntensityAugmentation,
-)
 
-# --- 1. User's Blur Sigma Calculation ---
+
+class SliceProfilePhysics(nn.Module):
+    """
+    Simulates the physical blurring caused by the MRI scanner's slice selection profile and in-plane sampling.
+
+    **MRI Physical Representation:**
+    In a real MRI scanner, a 2D slice is not a perfect geometric plane. It has a thickness determined
+    by the Radio Frequency (RF) excitation pulse.
+    - **Through-Plane (Slice Direction):** The RF pulse excites spins within a "slab." The sensitivity profile
+      across this slab is rarely a perfect rectangle (Boxcar). It is often trapezoidal or Gaussian due to
+      hardware limits on the RF pulse duration (truncated Sinc pulses). This causes "Partial Volume Effects"
+      where signal from adjacent tissues bleeds into the slice.
+    - **In-Plane (Phase/Frequency Directions):** Blurring occurs due to T2* relaxation during readout
+      and finite sampling windows, typically modeled as a Point Spread Function (PSF).
+
+    This class replaces generic Gaussian blurring with physically programmable kernels to accurately
+    model these distinct behaviors.
+
+    Args:
+        profile_type (str): The shape of the slice sensitivity profile.
+            - 'boxcar': Ideal rectangular profile (perfect slice selection).
+            - 'gaussian': Standard approximation (often used in simple simulations).
+            - 'trapezoid': Realistic profile for most clinical scanners (flat top with fading edges).
+        edge_width (float): For 'trapezoid', the fraction of the slice thickness that is the "slope"
+            (transition region). Represents the imperfect sharp cutoff of the RF pulse.
+    """
+    
+    def __init__(self, profile_type='trapezoid', edge_width=0.1):
+        """
+        Args:
+            profile_type: 'gaussian', 'boxcar' (ideal), or 'trapezoid' (realistic).
+            edge_width: For trapezoid, how much of the slice is the "slope" (0.0-0.5).
+                        0.1 means 10% on left and 10% on right are fading out.
+        """
+        super().__init__()
+        self.profile_type = profile_type
+        self.edge_width = edge_width
+
+    def get_slice_kernel(self, thickness_mm, current_res_mm, device):
+        """
+        Generates the 1D convolution kernel representing the slice sensitivity profile.
+        
+        Args:
+            thickness_mm (float): The target slice thickness to simulate.
+            current_res_mm (float): The current resolution of the input image.
+            device (torch.device): Device to create tensors on.
+            
+        Returns:
+            torch.Tensor: Normalized 1D kernel.
+        """
+        
+        # Calculate kernel size in voxels
+        # We need enough support to capture the profile
+        scale = thickness_mm / current_res_mm
+        kernel_size = int(math.ceil(scale * 3)) 
+        if kernel_size % 2 == 0: kernel_size += 1
+        
+        grid = torch.linspace(-kernel_size//2, kernel_size//2, kernel_size, device=device)
+        
+        # Normalize grid relative to slice thickness (0.5 = half thickness)
+        x = grid / scale 
+
+        if self.profile_type == 'boxcar':
+            # Ideal rectangular profile: 1 inside [-0.5, 0.5], 0 outside
+            kernel = (x.abs() <= 0.5).float()
+            
+        elif self.profile_type == 'gaussian':
+            # Standard approximation (FWHM = thickness)
+            # sigma corresponding to FWHM=1 is 1 / 2.355 = 0.4246
+            sigma = 0.4246
+            kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+            
+        elif self.profile_type == 'trapezoid':
+            # Realistic profile: Flat top with sloping edges
+            # Width of the flat top
+            flat_width = 0.5 - self.edge_width
+            
+            # Mask for flat region
+            flat_mask = (x.abs() <= flat_width).float()
+            
+            # Mask for slopes
+            slope_mask = ((x.abs() > flat_width) & (x.abs() <= 0.5)).float()
+            
+            # Linear decay on slopes
+            # Dist from edge start / edge width
+            slope_val = 1.0 - (x.abs() - flat_width) / self.edge_width
+            
+            kernel = flat_mask + slope_mask * slope_val
+            
+        else:
+            raise ValueError(f"Unknown profile: {self.profile_type}")
+
+        # Energy conservation (area under curve must be 1)
+        return kernel / kernel.sum()
+
+    def forward(self, img, resolution, thickness):
+        """
+        Applies the physics-based blurring to the input volume.
+
+        This method identifies the "Slice Select" direction (the one with the lowest resolution/highest thickness)
+        and applies the specific Slice Profile kernel. For the other two directions (In-Plane), it applies
+        a standard PSF blur.
+
+        Args:
+            img (torch.Tensor): Input image tensor (C, D, H, W).
+            resolution (torch.Tensor): Current voxel size of the input [res_D, res_H, res_W].
+            thickness (torch.Tensor): Target slice thickness to simulate [thick_D, thick_H, thick_W].
+        """
+        device = img.device
+        channels = img.shape[0]
+        
+        # Identify the slice dimension (the one with largest thickness/resolution ratio)
+        # Usually MRI stacks are anisotropic, so the "thick" axis is the slice axis.
+        factors = thickness / resolution
+        slice_dim_idx = torch.argmax(factors).item()
+        
+        # We process dimensions 1, 2, 3 (D, H, W)
+        for i, dim in enumerate([1, 2, 3]):
+            
+            # CASE A: Through-Plane (Slice Selection Axis)
+            # Apply the specific slice profile (Boxcar/Trapezoid/Gaussian)
+            if i == slice_dim_idx and factors[i] > 1.1: # Only if actually thick
+                kernel = self.get_slice_kernel(thickness[i], resolution[i], device)
+                
+            # CASE B: In-Plane (Frequency/Phase Encoding Axes)
+            # Apply standard PSF (Gaussian) due to T2* decay and sampling
+            else:
+                # Use standard Gaussian approximation for in-plane PSF
+                # Sigma is small (approx 0.5-0.8 pixels) for in-plane
+                sigma = 0.42 * (resolution[i] / resolution[i]) # ~0.42 pixels
+                
+                k_size = 5
+                k_grid = torch.arange(k_size, device=device) - k_size//2
+                kernel = torch.exp(-0.5 * (k_grid / sigma) ** 2)
+                kernel = kernel / kernel.sum()
+
+            # --- Convolve ---
+            # Reshape kernel for conv1d: (C, 1, K)
+            kernel = kernel.view(1, 1, -1).repeat(channels, 1, 1)
+            padding = kernel.shape[-1] // 2
+            
+            # Permute dimensions to apply 1D conv on the current axis
+            if i == 0:   # D
+                img_in = img.permute(0, 2, 3, 1) # (C, H, W, D)
+            elif i == 1: # H
+                img_in = img.permute(0, 1, 3, 2) # (C, D, W, H)
+            else:        # W
+                img_in = img # (C, D, H, W) is already fine for W if flattened differently?
+                # Actually conv1d operates on the last dim.
+                # So for W, we need input (C, D, H, W) -> flatten -> (Batch, C, W)
+                img_in = img.permute(0, 1, 2, 3) # No change needed relative to "last dim" logic
+            
+            # Flatten non-active dims into batch
+            shape_before = img_in.shape
+            # Combine all dims except the last one (the active one)
+            img_flat = img_in.reshape(-1, 1, shape_before[-1]) 
+            
+            # Apply Convolution
+            img_filtered = F.conv1d(img_flat, kernel[0:1], padding=padding)
+            
+            # Un-flatten and un-permute
+            img_out = img_filtered.view(shape_before)
+            
+            if i == 0:
+                img = img_out.permute(0, 3, 1, 2)
+            elif i == 1:
+                img = img_out.permute(0, 1, 3, 2)
+            else:
+                img = img_out # Already correct
+                
+        return img
+
+
+class BiasFieldCorruption(nn.Module):
+    """
+    Simulates MRI bias field (B1 inhomogeneity) artifacts.
+
+    **MRI Physical Representation:**
+    In MRI, the transmit/receive coils are not perfectly uniform. The sensitivity of the
+    Radio Frequency (RF) coils varies across space, especially in older scanners or with
+    surface coils. This causes low-frequency intensity variations where some parts of the
+    brain appear brighter or darker than others, despite having the same tissue type.
+    This is often called "intensity non-uniformity" (INU) or "shading."
+
+    The bias field is modeled as a multiplicative field that varies smoothly over the image volume.
+
+    Args:
+        bias_field_std (float): Standard deviation of the bias field coefficients.
+            Higher values create stronger shading effects (simulating poorer coil homogeneity).
+        bias_scale (float): Scale factor for the bias field resolution.
+            Controls the "frequency" of the shading. Smaller values mean very smooth,
+            gradual shading (typical of body coils); larger values allow for more localized
+            variations (typical of multi-channel surface coils).
+        prob (float): Probability of applying this corruption.
+
+    Input Shape:
+        (B, C, D, H, W) - Batch of 3D volumes
+
+    Output Shape:
+        (B, C, D, H, W) - Corrupted volumes with bias field applied
+
+    Example:
+        >>> bias_corruptor = BiasFieldCorruption(
+        ...     bias_field_std=0.3,
+        ...     bias_scale=0.025,
+        ...     prob=0.98
+        ... )
+        >>> input_volume = torch.randn(2, 1, 128, 128, 128)
+        >>> corrupted = bias_corruptor(input_volume)
+        >>> # Corrupted volume has smooth intensity variations
+    """
+
+    def __init__(
+        self, bias_field_std: float = 0.3, bias_scale: float = 0.025, prob: float = 0.98
+    ):
+        super().__init__()
+        self.bias_field_std = bias_field_std
+        self.bias_scale = bias_scale
+        self.prob = prob
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a multiplicative bias field to the input volume.
+
+        Args:
+            image: Input tensor of shape (B, C, D, H, W)
+
+        Returns:
+            Corrupted tensor of shape (B, C, D, H, W) with multiplicative bias field
+        """
+        if torch.rand(1).item() > self.prob:
+            return image
+
+        batch_size = image.shape[0]
+        spatial_shape = image.shape[2:]
+        device = image.device
+        outputs = []
+
+        for b in range(batch_size):
+            img = image[b : b + 1]
+
+            # Generate low-resolution bias field coefficients
+            bias_shape = [max(1, int(s * self.bias_scale)) for s in spatial_shape]
+            bias_coeffs = (
+                torch.randn(1, 1, *bias_shape, device=device) * self.bias_field_std
+            )
+
+            # Upsample to image size (creates smooth bias field)
+            resize_transform = Resize(spatial_size=spatial_shape, mode="trilinear")
+            # Resize expects input without batch dimension (C, D, H, W)
+            bias_field = resize_transform(bias_coeffs.squeeze(0)).unsqueeze(0)
+
+            # Convert to multiplicative field and apply
+            bias_field = torch.exp(bias_field)
+            img = img * bias_field
+            outputs.append(img)
+
+        return torch.cat(outputs, dim=0)
+
+
+class IntensityAugmentation(nn.Module):
+    """
+    Simulates variations in MRI contrast mechanisms and sensor dynamics.
+
+    **MRI Physical Representation:**
+    1. **Clipping:** Simulates the dynamic range limits of the MRI receiver/ADC (Analog-to-Digital Converter).
+       Extremely high signal intensities (e.g., from fat or flow artifacts) can saturate the sensor.
+    2. **Gamma Correction:** Simulates variations in tissue contrast (T1/T2 weighting).
+       Different pulse sequences (TE, TR settings) produce different contrast curves.
+       A power-law transform approximates these non-linear relationships between proton density
+       and final pixel intensity.
+       - Gamma < 1: Simulates images with brighter mid-tones (e.g., PD-weighted).
+       - Gamma > 1: Simulates images with darker mid-tones (higher contrast).
+
+    Gamma correction: I_out = I_in^(exp(γ)) where γ ~ N(0, gamma_std)
+
+    Args:
+        clip: Clipping bounds. Options:
+             - float: Clip to [0, clip]
+             - tuple: Clip to [clip[0], clip[1]]
+             - False: No clipping
+             Default: 300
+        gamma_std: Standard deviation of gamma parameter for gamma correction.
+                  Gamma is sampled from N(0, gamma_std). Higher = stronger variation.
+                  Default: 0.5
+        channel_wise: If True, apply different gamma per channel. If False, same
+                     gamma for all channels. Default: False
+        prob_gamma: Probability of applying gamma correction. Default: 0.95
+
+    Input Shape:
+        (B, C, D, H, W) - Batch of 3D volumes
+
+    Output Shape:
+        (B, C, D, H, W) - Augmented volumes
+
+    Example:
+        >>> intensity_aug = IntensityAugmentation(
+        ...     clip=300,
+        ...     gamma_std=0.5,
+        ...     prob_gamma=0.95
+        ... )
+        >>> input_volume = torch.randn(2, 1, 128, 128, 128).abs() * 100
+        >>> augmented = intensity_aug(input_volume)
+        >>> # Augmented volume has clipped values and modified contrast
+    """
+
+    def __init__(
+        self,
+        clip: Union[float, Tuple[float, float], bool] = 300,
+        gamma_std: float = 0.5,
+        channel_wise: bool = False,
+        prob_gamma: float = 0.95,
+    ):
+        super().__init__()
+        self.clip = clip
+        self.gamma_std = gamma_std
+        self.channel_wise = channel_wise
+        self.prob_gamma = prob_gamma
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Apply intensity augmentations to input volumes.
+
+        Args:
+            image: Input tensor of shape (B, C, D, H, W)
+
+        Returns:
+            Augmented tensor of shape (B, C, D, H, W)
+        """
+        batch_size, n_channels = image.shape[:2]
+        ndims = len(image.shape) - 2
+        device = image.device
+
+        # 1. Clip outliers
+        if self.clip:
+            if isinstance(self.clip, (int, float)):
+                image = torch.clamp(image, 0, self.clip)
+            else:
+                image = torch.clamp(image, self.clip[0], self.clip[1])
+
+        # 2. Gamma augmentation (power-law transform)
+        if self.gamma_std > 0 and torch.rand(1).item() < self.prob_gamma:
+            if self.channel_wise:
+                # Different gamma per channel
+                gamma = (
+                    torch.randn(batch_size, n_channels, *([1] * ndims), device=device)
+                    * self.gamma_std
+                )
+            else:
+                # Same gamma for all channels
+                gamma = (
+                    torch.randn(batch_size, 1, *([1] * ndims), device=device)
+                    * self.gamma_std
+                )
+
+            # Apply power transform: I^(exp(gamma))
+            image = torch.pow(image.clamp(min=1e-7), torch.exp(gamma))
+
+        return image
+
+
+class SampleResolution(nn.Module):
+    """
+    Simulates the selection of MRI acquisition protocols (Field of View and Matrix Size).
+
+    **MRI Physical Representation:**
+    MRI scanners are configured by technicians to acquire data at specific resolutions.
+    - **Isotropic:** High-resolution 3D scans (e.g., MP-RAGE) often have 1x1x1 mm voxels.
+    - **Anisotropic:** Fast clinical 2D scans (e.g., T2-weighted turbo spin echo) typically
+      have high in-plane resolution (e.g., 0.5 mm) but thick slices (e.g., 5.0 mm) to save time.
+
+    This class randomizes these parameters to train the model to handle diverse
+    clinical scenarios, from high-quality research scans to rapid emergency protocols.
+
+    This is crucial for training models that must handle diverse acquisition protocols,
+    such as:
+    - T1 scans: typically 1×1×1mm isotropic
+    - T2 scans: often 0.5×0.5×3mm anisotropic
+    - Clinical scans: highly variable (1×1×5mm common)
+
+    Args:
+        min_resolution: Minimum resolution (highest quality) in mm for each axis.
+                       Example: [1.0, 1.0, 1.0]
+        max_res_iso: Maximum isotropic resolution (lowest quality) in mm.
+                    Example: [1.0, 1.0, 1.0] for 1mm isotropic
+                    Can be None if only anisotropic is used.
+        max_res_aniso: Maximum anisotropic resolution in mm for each axis.
+                      Example: [9.0, 9.0, 9.0]
+                      Can be None if only isotropic is used.
+        prob_iso: Probability of sampling isotropic resolution (vs anisotropic).
+                 Default: 0.05 (95% anisotropic, 5% isotropic)
+        prob_min: Probability of using minimum (highest quality) resolution.
+                 Default: 0.05
+        return_thickness: If True, also returns slice thickness (can differ from resolution).
+                         Default: True
+
+    Returns:
+        If return_thickness=False:
+            resolution: Tensor of shape (batch_size, 3) with sampled resolutions
+        If return_thickness=True:
+            (resolution, thickness): Tuple of tensors, both shape (batch_size, 3)
+
+    Example:
+        >>> res_sampler = SampleResolution(
+        ...     min_resolution=[1.0, 1.0, 1.0],
+        ...     max_res_iso=[1.0, 1.0, 1.0],
+        ...     max_res_aniso=[9.0, 9.0, 9.0],
+        ...     prob_iso=0.02,
+        ...     prob_min=0.1
+        ... )
+        >>> resolution, thickness = res_sampler(batch_size=4)
+        >>> print(resolution.shape)  # (4, 3)
+        >>> # Example: [[1.0, 1.0, 5.2], [1.0, 1.0, 7.8], ...]
+    """
+
+    def __init__(
+        self,
+        min_resolution: List[float],
+        max_res_iso: Optional[List[float]] = None,
+        max_res_aniso: Optional[List[float]] = None,
+        prob_iso: float = 0.05,
+        prob_min: float = 0.05,
+        return_thickness: bool = True,
+    ):
+        super().__init__()
+        self.min_res = torch.tensor(min_resolution, dtype=torch.float32)
+        self.max_res_iso = (
+            torch.tensor(max_res_iso, dtype=torch.float32) if max_res_iso else None
+        )
+        self.max_res_aniso = (
+            torch.tensor(max_res_aniso, dtype=torch.float32) if max_res_aniso else None
+        )
+        self.prob_iso = prob_iso
+        self.prob_min = prob_min
+        self.return_thickness = return_thickness
+        self.n_dims = len(min_resolution)
+
+        assert (max_res_iso is not None) or (max_res_aniso is not None), (
+            "At least one of max_res_iso or max_res_aniso must be provided"
+        )
+
+    def forward(
+        self, batch_size: int
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Sample random resolutions for a batch.
+
+        Args:
+            batch_size: Number of resolution samples to generate
+
+        Returns:
+            If return_thickness=False: resolution tensor of shape (batch_size, 3)
+            If return_thickness=True: tuple of (resolution, thickness), both (batch_size, 3)
+        """
+        device = self.min_res.device
+
+        # Determine which samples are isotropic vs anisotropic
+        if (self.max_res_iso is not None) and (self.max_res_aniso is not None):
+            use_iso = torch.rand(batch_size, device=device) < self.prob_iso
+        elif self.max_res_iso is not None:
+            use_iso = torch.ones(batch_size, dtype=torch.bool, device=device)
+        else:
+            use_iso = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        resolution = torch.zeros(batch_size, self.n_dims, device=device)
+
+        for b in range(batch_size):
+            if use_iso[b]:
+                # Isotropic: same resolution for all dimensions
+                res_val = (
+                    torch.rand(1, device=device) * (self.max_res_iso - self.min_res)
+                    + self.min_res
+                )
+                resolution[b] = res_val[0]
+            else:
+                # Anisotropic: one dimension has high res, others have low res
+                high_res_dim = torch.randint(0, self.n_dims, (1,), device=device).item()
+                for d in range(self.n_dims):
+                    if d == high_res_dim:
+                        resolution[b, d] = (
+                            torch.rand(1, device=device)
+                            * (self.max_res_aniso[d] - self.min_res[d])
+                            + self.min_res[d]
+                        )
+                    else:
+                        resolution[b, d] = self.min_res[d]
+
+        # Apply minimum resolution override
+        use_min = torch.rand(batch_size, device=device) < self.prob_min
+        resolution[use_min] = self.min_res.unsqueeze(0).expand(use_min.sum(), -1)
+
+        if self.return_thickness:
+            # Sample slice thickness (can be >= resolution)
+            thickness = torch.zeros_like(resolution)
+            for b in range(batch_size):
+                for d in range(self.n_dims):
+                    thickness[b, d] = (
+                        torch.rand(1, device=device)
+                        * (resolution[b, d] - self.min_res[d])
+                        + self.min_res[d]
+                    )
+            return resolution, thickness
+        else:
+            return resolution
+
 
 def blurring_sigma_for_downsampling(
     current_res: Union[torch.Tensor, np.ndarray, List[float]],
@@ -32,7 +541,7 @@ def blurring_sigma_for_downsampling(
 ) -> torch.Tensor:
     """
     Compute Gaussian blur sigma for anti-aliasing before downsampling.
-    
+    Used for generic anti-aliasing approximations when physics-based SliceProfile is disabled.
     Formula: sigma = mult_coef * max(thickness, downsample_res) / current_res
     """
     device = None
@@ -131,6 +640,16 @@ def apply_dynamic_gaussian_blur(img: torch.Tensor, sigma: torch.Tensor) -> torch
 # --- 3. Artifact Helpers (Motion, Spikes, Aliasing) ---
 
 def apply_kspace_motion_ghosting(volume: torch.Tensor, axis: int, intensity: float = 0.5, num_ghosts: int = 2) -> torch.Tensor:
+    """
+    Simulates motion artifacts (ghosting) in K-space.
+
+    **MRI Physical Representation:**
+    Patient movement during the acquisition (especially during the Phase Encoding step) causes
+    positional inconsistencies in the frequency data. This manifests as "ghosts" or faint copies
+    of the anatomy propagated along the Phase Encoding direction.
+    
+    This function applies a phase error modulation in K-space to mathematically reproduce this effect.
+    """
     k_space = torch.fft.fftn(volume, dim=(1, 2, 3))
     k_space = torch.fft.fftshift(k_space, dim=(1, 2, 3))
     dims = volume.shape[1:]
@@ -145,6 +664,15 @@ def apply_kspace_motion_ghosting(volume: torch.Tensor, axis: int, intensity: flo
     return torch.abs(torch.fft.ifftn(k_space_corrupted, dim=(1, 2, 3)))
 
 def apply_kspace_spike(volume: torch.Tensor, intensity: float = 5.0) -> torch.Tensor:
+    """
+    Simulates RF spikes (zipper artifacts).
+
+    **MRI Physical Representation:**
+    Stray radio frequency (RF) interference (e.g., from a light bulb or unshielded equipment)
+    can appear as a high-intensity "spike" at a specific point in K-space.
+    When reconstructed via Inverse FFT, a single point in K-space transforms into a 
+    periodic stripe or "herringbone" pattern across the entire image.
+    """
     k_space = torch.fft.fftn(volume, dim=(1, 2, 3))
     C, D, H, W = volume.shape
     rd, rh, rw = torch.randint(0, D, (1,)), torch.randint(0, H, (1,)), torch.randint(0, W, (1,))
@@ -153,6 +681,14 @@ def apply_kspace_spike(volume: torch.Tensor, intensity: float = 5.0) -> torch.Te
     return torch.abs(torch.fft.ifftn(k_space, dim=(1, 2, 3)))
 
 def apply_aliasing(volume: torch.Tensor, axis: int, fold_pct: float = 0.2) -> torch.Tensor:
+    """
+    Simulates wrap-around aliasing (fold-over artifacts).
+
+    **MRI Physical Representation:**
+    If the Field of View (FOV) is smaller than the anatomy in the Phase Encoding direction,
+    signal from outside the FOV "wraps around" to the opposite side of the image.
+    This is common in abdominal or shoulder MRI where the body extends beyond the selected box.
+    """
     dims = list(volume.shape)
     spatial_axis = axis + 1
     original_size = dims[spatial_axis]
@@ -166,13 +702,16 @@ def apply_aliasing(volume: torch.Tensor, axis: int, fold_pct: float = 0.2) -> to
 
 class MRIArtifactSimulator(torch.nn.Module):
     """
-    Comprehensive MRI Artifact Simulator.
-    Pipeline:
-    1. Physics-based Blurring (PSF/Slice Thickness) <- Your function applied here
-    2. K-space corruptions (Motion, Spikes)
-    3. Aliasing/Wrap
-    4. Downsampling (Resolution loss)
-    5. Noise
+    The physics engine that orchestrates the degradation pipeline.
+
+    **Simulation Pipeline:**
+    1.  **Slice Profile (Physics-Based):** Applies realistic slice blurring (Trapezoidal/Boxcar) before downsampling.
+    2.  **K-Space Corruptions:** Transforms data to frequency domain to add Motion Ghosts and RF Spikes.
+    3.  **Aliasing:** Simulates FOV wrap-around in spatial domain.
+    4.  **Sampling (Resolution Loss):** Performs FFT cropping. This is the physically correct way to
+        simulate "Low Resolution." MRI resolution is defined by how far out in K-space we sample (k-max).
+        Cropping the high frequencies in K-space is exactly what happens when a scanner acquires a lower matrix size.
+    5.  **Thermal Noise:** Adds Rician/Gaussian noise to simulate electronic noise in the receive coils.
     """
 
     def __init__(
@@ -180,13 +719,13 @@ class MRIArtifactSimulator(torch.nn.Module):
         volume_res: List[float],
         target_res: List[float],
         output_shape: List[int],
-        prob_motion: float = 0.2,
-        prob_spike: float = 0.1,
-        prob_aliasing: float = 0.1,
+        prob_motion: float = 0.5,
+        prob_spike: float = 0.5,
+        prob_aliasing: float = 0.02,
         prob_noise: float = 0.95,
-        noise_std: float = 0.01,
-        motion_intensity: float = 0.5,
-        spike_intensity: float = 2.0,
+        noise_std: float = 0.05,
+        motion_intensity: float = 1.5,
+        spike_intensity: float = 0.04,
     ):
         super().__init__()
         self.volume_res = torch.tensor(volume_res, dtype=torch.float32)
@@ -199,6 +738,7 @@ class MRIArtifactSimulator(torch.nn.Module):
         self.noise_std = noise_std
         self.motion_intensity = motion_intensity
         self.spike_intensity = spike_intensity
+        self.physics_engine = SliceProfilePhysics(profile_type='trapezoid', edge_width=0.1)
 
     def forward(
         self,
@@ -222,17 +762,12 @@ class MRIArtifactSimulator(torch.nn.Module):
             else:
                 thk = acq_res
 
-            # --- STEP 1: PSF Blurring (Slice Profile / Partial Volume) ---
-            # Using your provided function
-            sigma = blurring_sigma_for_downsampling(
-                current_res=self.volume_res.to(device),
-                downsample_res=acq_res,
-                thickness=thk
+            # --- STEP 1: Slice Profile Blurring ---
+            img = self.physics_engine(
+                img, 
+                resolution=self.volume_res.to(device), # Current HR resolution
+                thickness=thk # Target slice thickness
             )
-            
-            # Apply the calculated blur BEFORE any downsampling or k-space corruption
-            # This simulates the physical magnetization averaging over the voxel
-            img = apply_dynamic_gaussian_blur(img, sigma)
 
 
             # --- STEP 2: K-Space Artifacts (Motion / Spike) ---
@@ -294,33 +829,23 @@ class MRIArtifactSimulator(torch.nn.Module):
 
         return torch.cat(outputs, dim=0)
 
+
 class HRLRDataGenerator:
     """
-    Enhanced Generator that orchestrates the High-Res to Low-Res degradation pipeline.
+    Domain randomization pipeline using frequency-domain downsampling.
 
-    It combines:
-    1. Spatial Domain Augmentations (Deformation, Bias Field, Intensity)
-    2. MRI Physics Simulation (via MRIArtifactSimulator)
+    This is an alternative to the spatial-domain approach in data.py.
+    Uses FFT-based k-space cropping for more realistic MRI simulation.
 
     Args:
         atlas_res: Resolution of input HR images in mm [x, y, z]
         target_res: Target output resolution in mm [x, y, z]
         output_shape: Output spatial shape [D, H, W]
-        
-        # --- Probability Controls ---
-        prob_motion: Probability of simulated patient motion (ghosting)
-        prob_spike: Probability of k-space spikes (zipper artifact)
-        prob_aliasing: Probability of fold-over aliasing
-        prob_bias_field: Probability of RF inhomogeneity
-        prob_noise: Probability of adding Rician noise
-        prob_deform: Probability of spatial elastic deformation
-        
-        # --- Other Parameters ---
-        min_resolution: Minimum resolution to sample [x, y, z]
-        max_res_aniso: Maximum slice thickness to sample [x, y, z]
-        randomise_res: If True, randomizes resolution/thickness
-        apply_intensity_aug: If True, applies gamma/contrast augmentation
-        clip_to_unit_range: If True, clips output to [0, 1]
+        min_resolution: Minimum (highest quality) resolution [x, y, z]
+        max_res_aniso: Maximum anisotropic resolution [x, y, z]
+        randomise_res: If True, randomize acquisition resolution
+        apply_intensity_aug: If True, apply intensity augmentation to LR
+        clip_to_unit_range: If True, clip outputs to [0, 1] range
     """
 
     def __init__(
@@ -329,12 +854,12 @@ class HRLRDataGenerator:
         target_res: list = [1.0, 1.0, 1.0],
         output_shape: list = [128, 128, 128],
         # Probabilities
-        prob_motion: float = 0.2,
-        prob_spike: float = 0.05,
-        prob_aliasing: float = 0.1,
+        prob_motion: float = 0.5,
+        prob_spike: float = 0.5,
+        prob_aliasing: float = 0.02,
         prob_bias_field: float = 0.5,
-        prob_noise: float = 0.8,
-        prob_deform: float = 0.8,
+        prob_noise: float = 0.95,
+        prob_gamma: float = 0.5,
         # Resolution simulation
         min_resolution: list = [1.0, 1.0, 1.0],
         max_res_aniso: list = [9.0, 9.0, 9.0],
@@ -342,52 +867,48 @@ class HRLRDataGenerator:
         # Toggles
         apply_intensity_aug: bool = True,
         clip_to_unit_range: bool = True,
+        # Augmentation
+        gamma_std: float = 0.5,
+        channel_wise: bool = False,
+        noise_std: float = 0.05,
+        motion_intensity: float = 1.5,
+        spike_intensity: float = 0.04,
     ):
         self.atlas_res = atlas_res
         self.target_res = target_res
         self.output_shape = output_shape
-        self.randomise_res = randomise_res
+        self.prob_bias_field = prob_bias_field
         self.apply_intensity_aug = apply_intensity_aug
         self.clip_to_unit_range = clip_to_unit_range
+        self.randomise_res = randomise_res
         
-        # Probabilities for conditional execution
-        self.prob_bias_field = prob_bias_field
-        self.prob_deform = prob_deform
-
         # 1. Resolution Sampler
         if randomise_res:
             self.res_sampler = SampleResolution(
                 min_resolution=min_resolution,
                 max_res_iso=None,
                 max_res_aniso=max_res_aniso,
-                prob_iso=0.0, # Force anisotropic for slice stack simulation
+                prob_iso=0.0, 
                 prob_min=0.05,
                 return_thickness=True,
             )
 
-        # 2. Spatial Deformation (Anatomy shape change)
-        self.deformer = RandomSpatialDeformation(
-            scaling_bounds=0.15,
-            rotation_bounds=15.0,
-            shearing_bounds=0.012,
-            translation_bounds=False,
-            elastic_sigma_range=(5.0, 7.0),
-            elastic_magnitude_range=(100.0, 200.0),
-            prob_deform=1.0, # We handle probability in generate_paired_data
-        )
-
-        # 3. Bias Field (RF Inhomogeneity)
+        # 2. Bias Field
         self.bias = BiasFieldCorruption(
-            bias_field_std=0.3, bias_scale=0.025, prob=1.0 # Prob handled manually
+            bias_field_std=0.3, bias_scale=0.025, prob=1.0 
         )
 
-        # 4. Intensity Augmentation (Contrast)
+        # 3. Intensity Augmentation
         if apply_intensity_aug:
+            # Note: Gamma is applied to normalized data, which works fine for [0,1]
             self.intensity_aug = IntensityAugmentation(
-                clip=300, gamma_std=0.5, channel_wise=False, prob_gamma=0.5
+                clip=False, # Don't clip here, we handle it globally
+                gamma_std=gamma_std, 
+                channel_wise=channel_wise,
+                prob_gamma=prob_gamma,
             )
 
-        # 5. MRI Physics Simulator (The core engine)
+        # 4. MRI Physics Simulator
         self.artifact_simulator = MRIArtifactSimulator(
             volume_res=atlas_res,
             target_res=target_res,
@@ -396,13 +917,14 @@ class HRLRDataGenerator:
             prob_spike=prob_spike,
             prob_aliasing=prob_aliasing,
             prob_noise=prob_noise,
-            noise_std=0.02, # Base noise level
-            motion_intensity=0.5
+            noise_std=noise_std,
+            spike_intensity=spike_intensity,
+            motion_intensity=motion_intensity,
         )
 
         # Normalization helper
         self.normalizer = ScaleIntensityRangePercentiles(
-            lower=0, upper=100, b_min=0.0, b_max=1.0, clip=True
+            lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, clip=True
         )
 
     def _normalize_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -415,67 +937,75 @@ class HRLRDataGenerator:
         return_resolution: bool = False,
     ):
         """
-        Generate paired LR-HR training data.
-        
-        Flow:
-        HR Image -> Deform -> Bias -> Intensity -> [Simulator: Blur->Artifacts->Downsample->Noise] -> LR Image
+        Generate paired LR-HR training data with Consistent Intensity.
         """
         batch_size = hr_images.shape[0]
         device = hr_images.device
 
-        # === HIGH-RESOLUTION PATH (Target) ===
-        hr_augmented = hr_images.clone()
+        # === STEP 1: NORMALIZE HR TO FIXED TARGET DOMAIN ===
+        # Normalize the HR image to [0, 1] immediately.
+        # This establishes the "Ground Truth" intensity space.
+        hr_augmented = self._normalize_image(hr_images)
 
-        # === LOW-RESOLUTION PATH (Input) ===
+        # === STEP 2: CREATE LR FROM NORMALIZED HR ===
+        # Clone the normalized HR. Any degradation applied now is 
+        # relative to this 0-1 scale.
         lr_images = hr_augmented.clone()
 
-        # 1. Apply Spatial Deformations (Anatomy)
-        # Applied to BOTH HR and LR so they align, or just LR? 
-        # Typically in SR, we want HR and LR to be spatially aligned "ground truth".
-        # So we deform both (or the input) before splitting.
-        if torch.rand(1).item() < self.prob_deform:
-            # We deform the base image, so HR and LR track the same anatomy
-            lr_images = self.deformer(lr_images)
-            hr_augmented = lr_images.clone() # HR ground truth is the deformed high-quality image
-
-        # 2. Apply Bias Field 
-        # Usually only on LR (input), as we want the network to remove it.
+        # === STEP 3: APPLY DEGRADATIONS ===
+        
+        # A. Bias Field (Multiplicative shading)
+        # This will shift pixel values locally (e.g., 0.8 -> 0.6 or 0.8 -> 0.95)
+        # We WANT this mismatch so the network learns to correct it.
         if torch.rand(1).item() < self.prob_bias_field:
             lr_images = self.bias(lr_images)
 
-        # 3. Apply Intensity Augmentation
+        # B. Intensity Augmentation (Gamma)
+        # Simulates different contrast settings (e.g., T1 vs T2-like contrast shifts)
         if self.apply_intensity_aug:
             lr_images = self.intensity_aug(lr_images)
 
-        # Normalize to [0, 1] before physics simulation
-        hr_augmented = self._normalize_image(hr_augmented)
-        lr_images = self._normalize_image(lr_images)
-
-        # 4. MRI Physics Simulation
+        # C. Physics Simulation (PSF, downsampling, noise, motion, aliasing)
         resolution = None
         thickness = None
 
         if self.randomise_res:
-            # Sample random acquisition parameters
             resolution, thickness = self.res_sampler(batch_size)
             resolution = resolution.to(device)
             thickness = thickness.to(device)
-
-            # Apply: Blur -> Ghosting -> Aliasing -> Downsampling -> Noise
             lr_images = self.artifact_simulator(lr_images, resolution, thickness)
         else:
-            # Fixed resolution path
             resolution = torch.tensor([self.atlas_res] * batch_size, dtype=torch.float32, device=device)
             thickness = resolution.clone()
             lr_images = self.artifact_simulator(lr_images, resolution, thickness)
 
-        # Final normalization to ensure strict [0, 1] range after noise addition
-        lr_images = self._normalize_image(lr_images)
+        # === STEP 3: REALISTIC LR INTENSITY NORMALIZATION ===
 
         if self.clip_to_unit_range:
-            lr_images = torch.clamp(lr_images, 0.0, 1.0)
+            # Per-volume soft clipping + min-max normalization to [0, 1]
+            lr_norm = []
+            for b in range(batch_size):
+                lr_b = lr_images[b:b+1]
+
+                # (1) Compute soft clipping bounds
+                low = torch.quantile(lr_b, 0.005)
+                high = torch.quantile(lr_b, 0.995)
+
+                # (2) Apply clipping
+                lr_b = torch.clamp(lr_b, low, high)
+
+                # (3) Global min-max normalization
+                min_val = lr_b.min()
+                max_val = lr_b.max()
+                lr_b = (lr_b - min_val) / (max_val - min_val + 1e-8)
+
+                lr_norm.append(lr_b)
+
+            lr_images = torch.cat(lr_norm, dim=0)
+
+            # HR is already normalized by percentiles; clip tiny float drift
             hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
-        
+
         if return_resolution:
             return lr_images, hr_augmented, resolution, thickness
         else:
@@ -546,7 +1076,19 @@ def create_dataset(
         else:
             transforms.append(CenterSpatialCropd(keys=["image"], roi_size=target_shape))
             transforms.append(SpatialPadd(keys=["image"], spatial_size=target_shape))
-
+    if is_training:
+        transforms.append(
+            RandAffined(
+                keys=["image"],
+                prob=0.3,                       
+                rotate_range=(0.1, 0.1, 0.1),
+                scale_range=(0.1, 0.1, 0.1),
+                shear_range=None,
+                translate_range=(5, 5, 5),     # optional
+                mode="bilinear",
+                padding_mode="border",
+            )
+        )
     transforms.append(ToTensord(keys=["image"]))
     transform = Compose(transforms)
 
