@@ -699,11 +699,27 @@ class L1SSIMLoss(nn.Module):
         self.ssim_loss = MonaiSSIM(spatial_dims=3)
         self.l1 = nn.L1Loss()
         self.alpha = alpha
+        # Store last computed components for tracking
+        self.last_l1_component = None
+        self.last_ssim_component = None
 
     def forward(self, pred, target):
         l1 = self.l1(pred, target)
-        ssim = self.ssim_loss(pred, target)    
-        return self.alpha * l1 + (1 - self.alpha) * ssim
+        ssim = self.ssim_loss(pred, target)
+        combined_loss = self.alpha * l1 + (1 - self.alpha) * ssim
+
+        # Store components as instance attributes for retrieval
+        self.last_l1_component = l1.item()
+        self.last_ssim_component = ssim.item()
+
+        return combined_loss
+
+    def get_components(self):
+        """Return the last computed L1 and SSIM components."""
+        return {
+            'l1': self.last_l1_component,
+            'ssim': self.last_ssim_component
+        }
 
 def get_loss_function(loss_name: str):
     """

@@ -400,8 +400,15 @@ def train_regression_model(
 
         # Define CSV headers
         csv_headers = ["epoch", "loss_type", "train_loss", "learning_rate", "epoch_time", "data_loading_time", "forward_backward_time"]
+
+        # Add L1+SSIM component tracking
+        if loss_name == "l1+ssim":
+            csv_headers.extend(["train_l1_component", "train_ssim_component"])
+
         if val_dataloader:
             csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"])
+            if loss_name == "l1+ssim":
+                csv_headers.extend(["val_l1_component", "val_ssim_component"])
 
         # Open CSV file for writing (append if resuming training)
         csv_file = open(csv_path, mode='a', newline='')
@@ -419,6 +426,10 @@ def train_regression_model(
         epoch_start_time = time.time()
         model.train()
         epoch_loss = 0.0
+        # Track L1 and SSIM components separately (only for l1+ssim loss)
+        if loss_name == "l1+ssim":
+            epoch_l1_component = 0.0
+            epoch_ssim_component = 0.0
 
         # Timing accumulators
         data_loading_time = 0.0
@@ -468,6 +479,12 @@ def train_regression_model(
                 output = model(input_img)
                 loss = criterion(output, target_img)
 
+                # Capture L1 and SSIM components if using l1+ssim loss
+                if loss_name == "l1+ssim":
+                    components = criterion.get_components()
+                    batch_l1 = components['l1']
+                    batch_ssim = components['ssim']
+
                 # Backward pass using accelerator
                 optimizer.zero_grad()
                 accelerator.backward(loss)
@@ -481,6 +498,11 @@ def train_regression_model(
 
             epoch_loss += loss.item()
 
+            # Accumulate components
+            if loss_name == "l1+ssim":
+                epoch_l1_component += batch_l1
+                epoch_ssim_component += batch_ssim
+
             # Forward/backward time
             forward_backward_time += time.time() - model_start_time
 
@@ -492,6 +514,14 @@ def train_regression_model(
             batch_start_time = time.time()
 
         avg_loss = epoch_loss / len(dataloader)
+
+        # Compute average components
+        if loss_name == "l1+ssim":
+            avg_l1_component = epoch_l1_component / len(dataloader)
+            avg_ssim_component = epoch_ssim_component / len(dataloader)
+        else:
+            avg_l1_component = None
+            avg_ssim_component = None
 
         # Validation (run only at specified intervals)
         val_loss = None
@@ -510,6 +540,12 @@ def train_regression_model(
                 "r2": 0.0,
                 "ssim": 0.0,
             }
+
+            # Add component tracking for l1+ssim loss
+            if loss_name == "l1+ssim":
+                metrics_sum["l1_component"] = 0.0
+                metrics_sum["ssim_component"] = 0.0
+
             num_val_batches = 0
 
             with torch.no_grad():
@@ -541,6 +577,12 @@ def train_regression_model(
                             loss = criterion(output_sample, target_sample)
                             val_epoch_loss += loss.item()
 
+                            # Capture components for l1+ssim loss
+                            if loss_name == "l1+ssim":
+                                components = criterion.get_components()
+                                metrics_sum["l1_component"] += components['l1']
+                                metrics_sum["ssim_component"] += components['ssim']
+
                             batch_metrics = calculate_metrics(output_sample, target_sample, max_val=1.0)
                             for key in metrics_sum:
                                 metrics_sum[key] += batch_metrics[key]
@@ -553,6 +595,12 @@ def train_regression_model(
                         output = model(input_img)
                         loss = criterion(output, target_img)
                         val_epoch_loss += loss.item()
+
+                        # Capture components for l1+ssim loss
+                        if loss_name == "l1+ssim":
+                            components = criterion.get_components()
+                            metrics_sum["l1_component"] += components['l1']
+                            metrics_sum["ssim_component"] += components['ssim']
 
                         # Calculate metrics for this batch
                         batch_metrics = calculate_metrics(output, target_img, max_val=1.0)
@@ -572,6 +620,14 @@ def train_regression_model(
                 print(
                     f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - Val Loss: {val_loss:.4f}"
                 )
+
+                # Add component breakdown for l1+ssim
+                if loss_name == "l1+ssim":
+                    print(
+                        f"  Loss Components - Train [L1: {avg_l1_component:.4f}, SSIM: {avg_ssim_component:.4f}] | "
+                        f"Val [L1: {val_metrics['l1_component']:.4f}, SSIM: {val_metrics['ssim_component']:.4f}]"
+                    )
+
                 print(
                     f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | MSE: {val_metrics['mse']:.6f} | "
                     f"RMSE: {val_metrics['rmse']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB | "
@@ -588,6 +644,13 @@ def train_regression_model(
                     f"Epoch {epoch + 1}/{epochs} - Average Loss: {avg_loss:.4f} - "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                 )
+
+                # Add component breakdown for l1+ssim
+                if loss_name == "l1+ssim":
+                    print(
+                        f"  Loss Components - L1: {avg_l1_component:.4f}, SSIM: {avg_ssim_component:.4f}"
+                    )
+
                 print(
                     f"  Timing - Epoch: {epoch_time:.1f}s | Data: {data_loading_time:.1f}s | "
                     f"Model: {forward_backward_time:.1f}s"
@@ -606,6 +669,11 @@ def train_regression_model(
                 "forward_backward_time": forward_backward_time,
             }
 
+            # Add training components for l1+ssim
+            if loss_name == "l1+ssim":
+                log_data["train_l1_component"] = avg_l1_component
+                log_data["train_ssim_component"] = avg_ssim_component
+
             if val_dataloader and val_loss is not None and val_metrics is not None:
                 log_data.update({
                     "val_loss": val_loss,
@@ -617,6 +685,11 @@ def train_regression_model(
                     "val_ssim": val_metrics['ssim'],
                     "validation_time": validation_time,
                 })
+
+                # Add validation components for l1+ssim
+                if loss_name == "l1+ssim":
+                    log_data["val_l1_component"] = val_metrics['l1_component']
+                    log_data["val_ssim_component"] = val_metrics['ssim_component']
 
             csv_writer.writerow(log_data)
             csv_file.flush()  # Ensure data is written immediately
@@ -632,6 +705,13 @@ def train_regression_model(
                 "timing/forward_backward_time": forward_backward_time,
             }
 
+            # Add training components for l1+ssim
+            if loss_name == "l1+ssim":
+                wandb_log_data.update({
+                    "train/l1_component": avg_l1_component,
+                    "train/ssim_component": avg_ssim_component,
+                })
+
             if val_dataloader and val_loss is not None and val_metrics is not None:
                 wandb_log_data.update({
                     "val/loss": val_loss,
@@ -643,6 +723,13 @@ def train_regression_model(
                     "val/ssim": val_metrics['ssim'],
                     "timing/validation_time": validation_time,
                 })
+
+                # Add validation components for l1+ssim
+                if loss_name == "l1+ssim":
+                    wandb_log_data.update({
+                        "val/l1_component": val_metrics['l1_component'],
+                        "val/ssim_component": val_metrics['ssim_component'],
+                    })
 
             wandb.log(wandb_log_data)
 
